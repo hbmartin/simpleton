@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/haroldmartin/simpleton/internal/domain"
@@ -97,6 +99,14 @@ func (r ContainerRunner) Run(ctx context.Context, repo string, policy domain.Exe
 	}
 	started := time.Now()
 	cmd := exec.CommandContext(ctx, runtimePath, args...)
+	var cancellationWon atomic.Bool
+	cmd.Cancel = func() error {
+		err := cmd.Process.Kill()
+		if err == nil {
+			cancellationWon.Store(true)
+		}
+		return err
+	}
 	cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin"}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -109,13 +119,27 @@ func (r ContainerRunner) Run(ctx context.Context, repo string, policy domain.Exe
 	if err == nil {
 		return result, nil
 	}
+	return classifyRunError(ctx, result, err, cancellationWon.Load(), stderr.String())
+}
+
+func classifyRunError(ctx context.Context, result CommandResult, runErr error, cancellationWon bool, stderr string) (CommandResult, error) {
 	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		result.ExitCode = exitErr.ExitCode()
+	if errors.As(runErr, &exitErr) {
+		exitCode := exitErr.ExitCode()
+		if cancellationWon && cancellationExitCode(exitCode) {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return result, ctxErr
+			}
+		}
+		result.ExitCode = exitCode
 		return result, nil
 	}
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return result, context.DeadlineExceeded
+	if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(runErr, ctxErr) {
+		return result, ctxErr
 	}
-	return result, fmt.Errorf("run container: %w: %s", err, strings.TrimSpace(stderr.String()))
+	return result, fmt.Errorf("run container: %w: %s", runErr, strings.TrimSpace(stderr))
+}
+
+func cancellationExitCode(exitCode int) bool {
+	return exitCode < 0 || runtime.GOOS == "windows" && exitCode == 1
 }

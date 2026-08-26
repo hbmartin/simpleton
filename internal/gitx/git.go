@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -147,23 +149,75 @@ func (r Repository) WorktreeDigest(ctx context.Context) (string, error) {
 	paths := bytes.Split(untrackedOutput, []byte{0})
 	sort.Slice(paths, func(i, j int) bool { return bytes.Compare(paths[i], paths[j]) < 0 })
 	hash := sha256.New()
-	_, _ = hash.Write(status)
-	_, _ = hash.Write(unstaged)
-	_, _ = hash.Write(staged)
+	writeDigestField(hash, []byte("status"))
+	writeDigestField(hash, status)
+	writeDigestField(hash, []byte("unstaged"))
+	writeDigestField(hash, unstaged)
+	writeDigestField(hash, []byte("staged"))
+	writeDigestField(hash, staged)
 	for _, rawPath := range paths {
 		if len(rawPath) == 0 {
 			continue
 		}
 		path := string(rawPath)
-		content, readErr := os.ReadFile(filepath.Join(r.Path, filepath.FromSlash(path)))
+		content, kind, readErr := readWorktreeEntry(ctx, filepath.Join(r.Path, filepath.FromSlash(path)))
 		if readErr != nil {
-			return "", readErr
+			return "", fmt.Errorf("read untracked path %q: %w", path, readErr)
 		}
-		_, _ = hash.Write(rawPath)
-		_, _ = hash.Write([]byte{0})
-		_, _ = hash.Write(content)
+		writeDigestField(hash, []byte("entry"))
+		writeDigestField(hash, rawPath)
+		writeDigestField(hash, []byte(kind))
+		writeDigestField(hash, content)
 	}
 	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+func writeDigestField(writer io.Writer, value []byte) {
+	var length [8]byte
+	binary.BigEndian.PutUint64(length[:], uint64(len(value)))
+	_, _ = writer.Write(length[:])
+	_, _ = writer.Write(value)
+}
+
+func readWorktreeEntry(ctx context.Context, path string) ([]byte, string, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(path)
+		return []byte(target), "symlink", err
+	}
+	if info.IsDir() {
+		return readNestedRepository(ctx, path)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, "", fmt.Errorf("unsupported file type %s", info.Mode().Type())
+	}
+	content, err := os.ReadFile(path)
+	return content, "regular", err
+}
+
+func readNestedRepository(ctx context.Context, path string) ([]byte, string, error) {
+	nested := Repository{Path: path}
+	if _, err := nested.run(ctx, "rev-parse", "--git-dir"); err != nil {
+		return nil, "", fmt.Errorf("unsupported directory entry: %w", err)
+	}
+	head, err := nested.run(ctx, "rev-parse", "--verify", "HEAD")
+	if err != nil {
+		head, err = nested.run(ctx, "symbolic-ref", "-q", "HEAD")
+		if err != nil {
+			head = []byte("unborn")
+		}
+	}
+	worktree, err := nested.WorktreeDigest(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	var content bytes.Buffer
+	writeDigestField(&content, bytes.TrimSpace(head))
+	writeDigestField(&content, []byte(worktree))
+	return content.Bytes(), "git_repository", nil
 }
 
 func (r Repository) DetachedWorktree(ctx context.Context, revision string) (string, func() error, error) {

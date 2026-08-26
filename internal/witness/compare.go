@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"reflect"
 	"sort"
 
 	"github.com/haroldmartin/simpleton/internal/domain"
+	"github.com/haroldmartin/simpleton/internal/numeric"
 )
 
 // ObservationPair is one baseline/candidate execution of an Observation Spec.
@@ -178,22 +180,38 @@ func Promote(divergence domain.ObservedDivergence, approvedAtHead bool, contract
 }
 
 func equalWithTolerance(left, right any, tolerances *domain.Tolerances) (bool, error) {
-	leftNumber, leftIsNumber := number(left)
-	rightNumber, rightIsNumber := number(right)
+	leftNumber, leftIsNumber, err := number(left)
+	if err != nil {
+		return false, err
+	}
+	rightNumber, rightIsNumber, err := number(right)
+	if err != nil {
+		return false, err
+	}
 	if leftIsNumber || rightIsNumber {
 		if !leftIsNumber || !rightIsNumber {
 			return false, nil
 		}
 		if tolerances == nil || tolerances.Absolute == nil && tolerances.Relative == nil {
-			return leftNumber == rightNumber, nil
+			return leftNumber.Cmp(rightNumber) == 0, nil
 		}
-		difference := math.Abs(leftNumber - rightNumber)
-		if tolerances.Absolute != nil && difference <= *tolerances.Absolute {
-			return true, nil
+		difference := new(big.Rat).Sub(leftNumber, rightNumber)
+		difference.Abs(difference)
+		if tolerances.Absolute != nil {
+			absolute, ok := finiteRat(*tolerances.Absolute)
+			if ok && difference.Cmp(absolute) <= 0 {
+				return true, nil
+			}
 		}
 		if tolerances.Relative != nil {
-			scale := math.Max(math.Abs(leftNumber), math.Abs(rightNumber))
-			if difference <= *tolerances.Relative*scale {
+			relative, ok := finiteRat(*tolerances.Relative)
+			leftMagnitude := new(big.Rat).Abs(leftNumber)
+			rightMagnitude := new(big.Rat).Abs(rightNumber)
+			scale := leftMagnitude
+			if rightMagnitude.Cmp(leftMagnitude) > 0 {
+				scale = rightMagnitude
+			}
+			if ok && difference.Cmp(new(big.Rat).Mul(relative, scale)) <= 0 {
 				return true, nil
 			}
 		}
@@ -234,38 +252,47 @@ func equalWithTolerance(left, right any, tolerances *domain.Tolerances) (bool, e
 	return reflect.DeepEqual(left, right), nil
 }
 
-func number(value any) (float64, bool) {
+func number(value any) (*big.Rat, bool, error) {
 	switch typed := value.(type) {
 	case float64:
-		return typed, true
+		number, ok := finiteRat(typed)
+		return number, ok, nil
 	case float32:
-		return float64(typed), true
+		number, ok := finiteRat(float64(typed))
+		return number, ok, nil
 	case int:
-		return float64(typed), true
+		return new(big.Rat).SetInt64(int64(typed)), true, nil
 	case int8:
-		return float64(typed), true
+		return new(big.Rat).SetInt64(int64(typed)), true, nil
 	case int16:
-		return float64(typed), true
+		return new(big.Rat).SetInt64(int64(typed)), true, nil
 	case int32:
-		return float64(typed), true
+		return new(big.Rat).SetInt64(int64(typed)), true, nil
 	case int64:
-		return float64(typed), true
+		return new(big.Rat).SetInt64(typed), true, nil
 	case uint:
-		return float64(typed), true
+		return new(big.Rat).SetInt(new(big.Int).SetUint64(uint64(typed))), true, nil
 	case uint8:
-		return float64(typed), true
+		return new(big.Rat).SetInt(new(big.Int).SetUint64(uint64(typed))), true, nil
 	case uint16:
-		return float64(typed), true
+		return new(big.Rat).SetInt(new(big.Int).SetUint64(uint64(typed))), true, nil
 	case uint32:
-		return float64(typed), true
+		return new(big.Rat).SetInt(new(big.Int).SetUint64(uint64(typed))), true, nil
 	case uint64:
-		return float64(typed), true
+		return new(big.Rat).SetInt(new(big.Int).SetUint64(typed)), true, nil
 	case json.Number:
-		n, err := typed.Float64()
-		return n, err == nil
+		n, err := numeric.ParseJSONNumber(typed)
+		return n, err == nil, err
 	default:
-		return 0, false
+		return nil, false, nil
 	}
+}
+
+func finiteRat(value float64) (*big.Rat, bool) {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return nil, false
+	}
+	return new(big.Rat).SetFloat64(value), true
 }
 
 func asJSONValue(value any) (any, error) {

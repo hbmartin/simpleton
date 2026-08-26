@@ -6,6 +6,7 @@ import ts from "typescript";
 
 const PROTOCOL_VERSION = "1";
 const PACK_VERSION = "0.1.0";
+const MAX_GIT_OUTPUT = 32 * 1024 * 1024;
 
 const capability = {
   language: "typescript",
@@ -129,11 +130,14 @@ function analyze(params) {
 }
 
 function listFiles(repo, revision) {
-  return execFileSync("git", ["-C", repo, "ls-tree", "-r", "--name-only", "-z", revision], { encoding: "utf8" }).split("\0").filter(Boolean);
+  return execFileSync("git", ["-C", repo, "ls-tree", "-r", "--name-only", "-z", revision], {
+    encoding: "utf8",
+    maxBuffer: MAX_GIT_OUTPUT,
+  }).split("\0").filter(Boolean);
 }
 
 function showFile(repo, revision, file) {
-  return execFileSync("git", ["-C", repo, "show", `${revision}:${file}`], { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 });
+  return execFileSync("git", ["-C", repo, "show", `${revision}:${file}`], { encoding: "utf8", maxBuffer: MAX_GIT_OUTPUT });
 }
 
 function collectCallers(program, repo, changed) {
