@@ -12,7 +12,7 @@ from collections import defaultdict
 from typing import Any
 
 PROTOCOL_VERSION = "1"
-PACK_VERSION = "0.1.0"
+PACK_VERSION = "0.1.1"
 
 CAPABILITY = {
     "language": "python",
@@ -93,9 +93,7 @@ def analyze(params: dict[str, Any]) -> dict[str, Any]:
         tree = trees.get(file)
         if tree is None:
             continue
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
+        for node, symbol in qualified_functions(tree):
             risks = effect_risks(node, tree)
             boundaries = [
                 {
@@ -112,7 +110,7 @@ def analyze(params: dict[str, Any]) -> dict[str, Any]:
                 boundaries.append(
                     {
                         "kind": "public_api",
-                        "symbol": node.name,
+                        "symbol": symbol,
                         "path": file,
                         "stable": True,
                         "generated": False,
@@ -122,7 +120,7 @@ def analyze(params: dict[str, Any]) -> dict[str, Any]:
             boundaries.append(
                 {
                     "kind": "direct_unit",
-                    "symbol": node.name,
+                    "symbol": symbol,
                     "path": file,
                     "stable": False,
                     "generated": False,
@@ -132,10 +130,10 @@ def analyze(params: dict[str, Any]) -> dict[str, Any]:
             confidence = clamp(0.82 - len(risks) * 0.12)
             targets.append(
                 {
-                    "id": stable_id("python", file, node.name),
+                    "id": stable_id("python", file, symbol),
                     "language": "python",
                     "file": file,
-                    "symbol": node.name,
+                    "symbol": symbol,
                     "kind": "function",
                     "scope_type": "symbol",
                     "observation_candidates": boundaries,
@@ -154,10 +152,10 @@ def analyze(params: dict[str, Any]) -> dict[str, Any]:
             if statements >= 30 or complexity >= 10:
                 opportunities.append(
                     {
-                        "id": stable_id("python-opportunity", file, node.name),
+                        "id": stable_id("python-opportunity", file, symbol),
                         "language": "python",
                         "category": "oversized_or_complex_unit",
-                        "region": f"{file}:{node.name}",
+                        "region": f"{file}:{symbol}",
                         "evidence": [f"statements={statements}", f"cyclomatic={complexity}"],
                         "allowed_files": [file],
                         "benefit": clamp(statements / 80 + complexity / 30),
@@ -187,6 +185,38 @@ def analyze(params: dict[str, Any]) -> dict[str, Any]:
         ],
         "opportunities": opportunities,
     }
+
+
+def qualified_functions(
+    tree: ast.Module,
+) -> list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, str]]:
+    functions: list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, str]] = []
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.scope: list[str] = []
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self.scope.append(node.name)
+            self.generic_visit(node)
+            self.scope.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            symbol = ".".join([*self.scope, node.name])
+            functions.append((node, symbol))
+            self.scope.append(node.name)
+            self.generic_visit(node)
+            self.scope.pop()
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            symbol = ".".join([*self.scope, node.name])
+            functions.append((node, symbol))
+            self.scope.append(node.name)
+            self.generic_visit(node)
+            self.scope.pop()
+
+    Visitor().visit(tree)
+    return functions
 
 
 def collect_callers(

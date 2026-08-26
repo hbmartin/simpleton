@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import readline from "node:readline";
 import path from "node:path";
 import ts from "typescript";
 
 const PROTOCOL_VERSION = "1";
-const PACK_VERSION = "0.1.0";
+const PACK_VERSION = "0.1.1";
 const MAX_GIT_OUTPUT = 32 * 1024 * 1024;
 
 const capability = {
@@ -84,9 +85,9 @@ function analyze(params) {
   for (const source of program.getSourceFiles()) {
     const relative = slash(path.relative(repo, source.fileName));
     if (!changed.has(relative)) continue;
-    visitFunctions(source, (node, name) => {
-      const risks = effectRisks(node, source);
-      const boundaries = (callers.get(name) ?? []).map((caller) => ({
+    visitFunctions(source, (node, name, calledName) => {
+		const risks = effectRisks(node, source);
+		const boundaries = (callers.get(calledName) ?? []).map((caller) => ({
         kind: "unchanged_caller", symbol: caller.symbol, path: caller.path, stable: true, generated: false, confidence: 0.82,
       }));
       if (isExported(node)) boundaries.push({ kind: "public_api", symbol: name, path: relative, stable: true, generated: false, confidence: 0.75 });
@@ -145,18 +146,26 @@ function collectCallers(program, repo, changed) {
   for (const source of program.getSourceFiles()) {
     const relative = slash(path.relative(repo, source.fileName));
     if (changed.has(relative) || relative.startsWith("..")) continue;
-    let enclosing = "<module>";
-    const visit = (node) => {
-      if (isFunctionLike(node)) enclosing = functionName(node) || enclosing;
+    const visit = (node, scope = [], enclosing = "<module>") => {
+      let childScope = scope;
+      let childEnclosing = enclosing;
+      if (isClassLike(node) && node.name && ts.isIdentifier(node.name)) childScope = [...scope, node.name.text];
+      if (isFunctionLike(node)) {
+        const name = functionName(node);
+        if (name) {
+          childEnclosing = [...scope, name].join(".");
+          childScope = [...scope, name];
+        }
+      }
       if (ts.isCallExpression(node)) {
         const name = calledName(node.expression);
         if (name) {
           const entries = callers.get(name) ?? [];
-          entries.push({ path: relative, symbol: enclosing });
+          entries.push({ path: relative, symbol: childEnclosing });
           callers.set(name, entries);
         }
       }
-      ts.forEachChild(node, visit);
+      ts.forEachChild(node, (child) => visit(child, childScope, childEnclosing));
     };
     visit(source);
   }
@@ -164,18 +173,28 @@ function collectCallers(program, repo, changed) {
 }
 
 function visitFunctions(source, callback) {
-  const visit = (node) => {
+  const visit = (node, scope = []) => {
+    let childScope = scope;
+    if (isClassLike(node) && node.name && ts.isIdentifier(node.name)) childScope = [...scope, node.name.text];
     if (isFunctionLike(node)) {
-      const name = functionName(node);
-      if (name) callback(node, name);
+      const calledName = functionName(node);
+      if (calledName) {
+        const name = [...scope, calledName].join(".");
+        callback(node, name, calledName);
+        childScope = [...scope, calledName];
+      }
     }
-    ts.forEachChild(node, visit);
+    ts.forEachChild(node, (child) => visit(child, childScope));
   };
   visit(source);
 }
 
 function isFunctionLike(node) {
   return ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node) || ts.isFunctionExpression(node) || ts.isArrowFunction(node);
+}
+
+function isClassLike(node) {
+  return ts.isClassDeclaration(node) || ts.isClassExpression(node);
 }
 
 function functionName(node) {
@@ -242,12 +261,7 @@ function cyclomatic(node) {
 }
 
 function stableID(...parts) {
-  let hash = 2166136261;
-  for (const character of parts.join("\0")) {
-    hash ^= character.codePointAt(0);
-    hash = Math.imul(hash, 16777619);
-  }
-  return (hash >>> 0).toString(16).padStart(8, "0");
+  return createHash("sha256").update(parts.join("\0"), "utf8").digest("hex").slice(0, 16);
 }
 
 function clamp(value) { return Math.max(0, Math.min(1, value)); }

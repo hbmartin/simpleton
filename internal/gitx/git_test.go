@@ -1,6 +1,7 @@
 package gitx
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"os/exec"
@@ -44,6 +45,33 @@ func TestWorktreeDigestAndDetachedExecutionTree(t *testing.T) {
 	content, err := os.ReadFile(filepath.Join(detached, "value.txt"))
 	if err != nil || string(content) != "base" {
 		t.Fatalf("detached execution tree is not the requested commit: %q err=%v", content, err)
+	}
+}
+
+func TestFilesAtReadsMultipleBlobsInOneBatch(t *testing.T) {
+	path := t.TempDir()
+	gitCommand(t, path, "init", "-q")
+	gitCommand(t, path, "config", "user.email", "simpleton@example.invalid")
+	gitCommand(t, path, "config", "user.name", "Simpleton Test")
+	if err := os.WriteFile(filepath.Join(path, "first.txt"), []byte("first\nvalue"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "second.txt"), []byte{0, 1, 2, '\n'}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, path, "add", ".")
+	gitCommand(t, path, "commit", "-qm", "sample")
+	repository, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := gitCommand(t, path, "rev-parse", "HEAD")
+	files, err := repository.FilesAt(context.Background(), revision, []string{"first.txt", "second.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(files["first.txt"]) != "first\nvalue" || !bytes.Equal(files["second.txt"], []byte{0, 1, 2, '\n'}) {
+		t.Fatalf("batch blob contents changed: %#v", files)
 	}
 }
 
@@ -140,6 +168,44 @@ func TestWorktreeDigestIncludesNestedRepositoryState(t *testing.T) {
 	second, err := repository.WorktreeDigest(context.Background())
 	if err != nil || first == second {
 		t.Fatalf("nested repository state did not affect digest: first=%s second=%s err=%v", first, second, err)
+	}
+}
+
+func TestWorktreeDigestEnforcesFileAndNestedRepositoryLimits(t *testing.T) {
+	repository := repositoryWithUntrackedFiles(t, map[string][]byte{"large.bin": []byte("1234")})
+	_, err := repository.worktreeDigest(context.Background(), worktreeDigestLimits{maxFileBytes: 3, maxNestedDepth: 1}, 0)
+	if err == nil || !strings.Contains(err.Error(), "digest limit") {
+		t.Fatalf("oversized untracked file was not rejected: %v", err)
+	}
+
+	path := t.TempDir()
+	gitCommand(t, path, "init", "-q")
+	gitCommand(t, path, "config", "user.email", "simpleton@example.invalid")
+	gitCommand(t, path, "config", "user.name", "Simpleton Test")
+	if err := os.WriteFile(filepath.Join(path, "tracked.txt"), []byte("tracked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, path, "add", ".")
+	gitCommand(t, path, "commit", "-qm", "root")
+	nested := filepath.Join(path, "nested")
+	if err := os.Mkdir(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, nested, "init", "-q")
+	gitCommand(t, nested, "config", "user.email", "simpleton@example.invalid")
+	gitCommand(t, nested, "config", "user.name", "Simpleton Test")
+	if err := os.WriteFile(filepath.Join(nested, "value.txt"), []byte("nested"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, nested, "add", ".")
+	gitCommand(t, nested, "commit", "-qm", "nested")
+	repository, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = repository.worktreeDigest(context.Background(), worktreeDigestLimits{maxFileBytes: 1024, maxNestedDepth: 0}, 0)
+	if err == nil || !strings.Contains(err.Error(), "depth exceeds") {
+		t.Fatalf("nested repository depth limit was not enforced: %v", err)
 	}
 }
 

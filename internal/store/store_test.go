@@ -40,6 +40,9 @@ func TestContentAddressedEvidenceAndOutcome(t *testing.T) {
 	if _, err := state.SaveEvidence(context.Background(), pack); err != nil {
 		t.Fatal(err)
 	}
+	// Force database/sql to discard idle connections so the next statement uses
+	// a fresh driver connection. Foreign keys must be enabled by the DSN there too.
+	state.db.SetMaxIdleConns(0)
 	accepted := true
 	if err := state.RecordOutcome(context.Background(), Outcome{RunID: "run-1", Accepted: &accepted}); err != nil {
 		t.Fatal(err)

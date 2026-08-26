@@ -2,6 +2,14 @@ package cache
 
 import "testing"
 
+func TestLockfileContentDigestPreservesInvalidUTF8Bytes(t *testing.T) {
+	first := digestContent([]byte{0xff})
+	second := digestContent([]byte{0xfe})
+	if first == second {
+		t.Fatalf("distinct invalid UTF-8 lockfiles collided: %s", first)
+	}
+}
+
 func TestEveryEvidenceDimensionInvalidatesKey(t *testing.T) {
 	base := Inputs{
 		BaseTree: "base", HeadTree: "head", Worktree: "clean",

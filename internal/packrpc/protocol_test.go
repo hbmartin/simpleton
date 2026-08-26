@@ -72,6 +72,25 @@ func TestCancelCancelsInflightRequest(t *testing.T) {
 	}
 }
 
+func TestServeReturnsWhenContextIsCancelledWhileInputIsIdle(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer writer.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	returned := make(chan error, 1)
+	go func() {
+		returned <- Serve(ctx, reader, io.Discard, &testHandler{})
+	}()
+	cancel()
+	select {
+	case err := <-returned:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Serve returned the wrong cancellation error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve remained blocked decoding idle input after cancellation")
+	}
+}
+
 func TestBudgetContextExpires(t *testing.T) {
 	ctx, cancel := budgetContext(context.Background(), 1)
 	defer cancel()

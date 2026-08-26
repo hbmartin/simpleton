@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"math/big"
 	"os"
@@ -80,7 +81,8 @@ func (p Planner) Analyze(ctx context.Context, request Request) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	hardCtx, hardCancel := context.WithTimeout(ctx, policy.Budgets.HardCeiling.Duration())
+	requestCtx := ctx
+	hardCtx, hardCancel := context.WithTimeout(requestCtx, policy.Budgets.HardCeiling.Duration())
 	defer hardCancel()
 	ctx = hardCtx
 	repo, err := gitx.Open(request.Repository)
@@ -199,16 +201,23 @@ func (p Planner) Analyze(ctx context.Context, request Request) (Result, error) {
 
 	runCtx, cancel := context.WithTimeout(ctx, policy.Budgets.Total.Duration())
 	defer cancel()
-	executionRepository := repo.Path
-	cleanupWorktree := func() error { return nil }
+	baselineRepository := repo.Path
+	candidateRepository := repo.Path
+	cleanupBaseline := func() error { return nil }
+	cleanupCandidate := func() error { return nil }
 	if len(policy.Commands) > 0 {
-		executionRepository, cleanupWorktree, err = repo.DetachedWorktree(runCtx, head)
+		baselineRepository, cleanupBaseline, err = repo.DetachedWorktree(runCtx, base)
 		if err != nil {
-			return Result{}, fmt.Errorf("prepare detached execution worktree: %w", err)
+			return Result{}, fmt.Errorf("prepare detached baseline worktree: %w", err)
 		}
-		defer cleanupWorktree()
+		defer cleanupBaseline()
+		candidateRepository, cleanupCandidate, err = repo.DetachedWorktree(runCtx, head)
+		if err != nil {
+			return Result{}, fmt.Errorf("prepare detached candidate worktree: %w", err)
+		}
+		defer cleanupCandidate()
 	}
-	commandMethods := p.runCommands(runCtx, executionRepository, policy)
+	commandMethods := p.runCommands(runCtx, baselineRepository, candidateRepository, policy)
 	pack.Methods = append(pack.Methods, commandMethods...)
 
 	packDir := request.PackDir
@@ -237,33 +246,44 @@ func (p Planner) Analyze(ctx context.Context, request Request) (Result, error) {
 		pack.SemanticAdvisory = true
 	}
 
-	if err := config.TelemetryAllowed(policy.Telemetry); err == nil {
-		fmCtx, fmCancel := context.WithTimeout(ctx, managedTimeout(policy, "managed_fm", 30*time.Second))
+	hardCeilingExhausted := errors.Is(hardCtx.Err(), context.DeadlineExceeded)
+	if err := config.TelemetryAllowed(policy.Telemetry); err == nil && !hardCeilingExhausted {
+		fmCtx, fmCancel := context.WithTimeout(requestCtx, managedTimeout(policy, "managed_fm", 30*time.Second))
 		pack.AdvisoryReview = p.FMClient.Review(fmCtx, managed.FMRequest{
 			Repository: policy.Telemetry.Repository, BaseRevision: base, HeadRevision: head,
 			Targets: pack.Targets, Methods: pack.Methods,
 			Instruction: "Return advisory semantic-risk suspicion and explanation only. Do not claim proof, safety, or a Behavioral Witness.",
 		})
 		fmCancel()
-	} else {
+	} else if err != nil {
 		pack.AdvisoryReview = domain.AdvisoryReview{Status: domain.StatusUnsupported, Reason: err.Error()}
+	} else {
+		pack.AdvisoryReview = domain.AdvisoryReview{Status: domain.StatusBudgetExhausted, Reason: "hard ceiling exhausted before managed review"}
 	}
 
 	pack.Blockers = policy.SelectBlockers(pack)
 	if err := report.WriteAll(output, pack); err != nil {
 		return Result{}, err
 	}
-	digest, err := state.SaveEvidence(ctx, pack)
+	saveCtx, saveCancel := context.WithTimeout(requestCtx, 30*time.Second)
+	digest, err := state.SaveEvidence(saveCtx, pack)
+	saveCancel()
 	if err != nil {
 		return Result{}, err
 	}
-	uploadCtx, uploadCancel := context.WithTimeout(ctx, managedTimeout(policy, "telemetry_upload", 15*time.Second))
-	pack.Telemetry = p.upload(uploadCtx, policy, pack)
-	uploadCancel()
+	if hardCeilingExhausted {
+		pack.Telemetry = domain.TelemetryOutcome{Status: "not_uploaded", Reason: "hard ceiling exhausted before managed upload", RetentionDays: 30}
+	} else {
+		uploadCtx, uploadCancel := context.WithTimeout(requestCtx, managedTimeout(policy, "telemetry_upload", 15*time.Second))
+		pack.Telemetry = p.upload(uploadCtx, policy, pack)
+		uploadCancel()
+	}
 	if err := report.WriteAll(output, pack); err != nil {
 		return Result{}, err
 	}
-	digest, err = state.SaveEvidence(ctx, pack)
+	saveCtx, saveCancel = context.WithTimeout(requestCtx, 30*time.Second)
+	digest, err = state.SaveEvidence(saveCtx, pack)
+	saveCancel()
 	if err != nil {
 		return Result{}, err
 	}
@@ -725,7 +745,7 @@ func (p Planner) resolveIntent(request Request, changed []gitx.ChangedFile, base
 	return intent, digest, approval, semanticAdvisory, "", nil
 }
 
-func (p Planner) runCommands(ctx context.Context, repo string, policy domain.Policy) []domain.MethodResult {
+func (p Planner) runCommands(ctx context.Context, baselineRepo, candidateRepo string, policy domain.Policy) []domain.MethodResult {
 	results := make([]domain.MethodResult, 0, len(policy.Commands))
 	for _, spec := range policy.Commands {
 		budget := policy.Budgets.Total.Duration()
@@ -738,32 +758,59 @@ func (p Planner) runCommands(ctx context.Context, repo string, policy domain.Pol
 		if image == "" {
 			image = policy.Execution.Image
 		}
-		result, err := p.Runner.Run(methodCtx, repo, policy.Execution, image, spec.Command)
-		cancel()
-		method := domain.MethodResult{ID: spec.ID, Language: spec.Language, Budget: budget.String(), DurationMS: time.Since(started).Milliseconds(), Findings: []domain.Finding{}}
+		baseline, baselineErr := p.Runner.Run(methodCtx, baselineRepo, policy.Execution, image, spec.Command)
+		method := domain.MethodResult{ID: spec.ID, Language: spec.Language, Budget: budget.String(), Findings: []domain.Finding{}}
 		switch {
-		case errors.Is(err, context.DeadlineExceeded):
+		case errors.Is(methodCtx.Err(), context.DeadlineExceeded) || errors.Is(baselineErr, context.DeadlineExceeded):
 			method.Status = domain.StatusBudgetExhausted
-			method.Reason = "method exceeded its policy budget"
-		case err != nil:
+			method.Reason = "baseline command exceeded its policy budget"
+		case baselineErr != nil:
 			method.Status = domain.StatusExecutionFailed
-			method.Reason = err.Error()
-		case result.UnsupportedReason != "":
+			method.Reason = "baseline command could not run: " + baselineErr.Error()
+		case baseline.UnsupportedReason != "":
 			method.Status = domain.StatusUnsupported
-			method.Reason = result.UnsupportedReason
-		case result.ExitCode != 0:
-			method.Status = domain.StatusRan
-			method.Findings = append(method.Findings, domain.Finding{
-				ID: domain.StableID(spec.ID, result.Stdout, result.Stderr), Category: spec.Category,
-				Title: spec.ID + " reported a regression", Detail: truncate(result.Stdout+"\n"+result.Stderr, 16<<10),
-				Validated: true, Advisory: false, MethodID: spec.ID,
-			})
+			method.Reason = "baseline command is unsupported: " + baseline.UnsupportedReason
+		case infrastructureExit(baseline.ExitCode):
+			method.Status = domain.StatusExecutionFailed
+			method.Reason = fmt.Sprintf("baseline container infrastructure failed with exit code %d", baseline.ExitCode)
+		case baseline.ExitCode != 0:
+			method.Status = domain.StatusInconclusive
+			method.Reason = fmt.Sprintf("baseline command failed with exit code %d; a regression cannot be established", baseline.ExitCode)
 		default:
-			method.Status = domain.StatusRan
+			candidate, candidateErr := p.Runner.Run(methodCtx, candidateRepo, policy.Execution, image, spec.Command)
+			switch {
+			case errors.Is(methodCtx.Err(), context.DeadlineExceeded) || errors.Is(candidateErr, context.DeadlineExceeded):
+				method.Status = domain.StatusBudgetExhausted
+				method.Reason = "candidate command exceeded its policy budget"
+			case candidateErr != nil:
+				method.Status = domain.StatusExecutionFailed
+				method.Reason = "candidate command could not run: " + candidateErr.Error()
+			case candidate.UnsupportedReason != "":
+				method.Status = domain.StatusUnsupported
+				method.Reason = "candidate command is unsupported: " + candidate.UnsupportedReason
+			case infrastructureExit(candidate.ExitCode):
+				method.Status = domain.StatusExecutionFailed
+				method.Reason = fmt.Sprintf("candidate container infrastructure failed with exit code %d", candidate.ExitCode)
+			case candidate.ExitCode != 0:
+				method.Status = domain.StatusRan
+				method.Findings = append(method.Findings, domain.Finding{
+					ID: domain.StableID(spec.ID, candidate.Stdout, candidate.Stderr), Category: spec.Category,
+					Title: spec.ID + " reported a regression", Detail: truncate(candidate.Stdout+"\n"+candidate.Stderr, 16<<10),
+					Validated: true, Advisory: false, MethodID: spec.ID,
+				})
+			default:
+				method.Status = domain.StatusRan
+			}
 		}
+		cancel()
+		method.DurationMS = time.Since(started).Milliseconds()
 		results = append(results, method)
 	}
 	return results
+}
+
+func infrastructureExit(exitCode int) bool {
+	return exitCode >= 125 && exitCode <= 127
 }
 
 func (p Planner) runPack(ctx context.Context, request Request, policy domain.Policy, packDir, language string, files []gitx.ChangedFile, base, head, intentDigest, environmentDigest string) (domain.PackCapability, packrpc.AnalyzeResult, domain.MethodResult) {
@@ -826,7 +873,8 @@ func (p Planner) upload(ctx context.Context, policy domain.Policy, pack domain.E
 	if err := config.TelemetryAllowed(policy.Telemetry); err != nil {
 		return domain.TelemetryOutcome{Status: "not_uploaded", Reason: err.Error(), RetentionDays: 30}
 	}
-	payload, redactions, err := managed.NewRedactor().Evidence(pack)
+	managedPack := managedEvidencePack(pack, policy.Telemetry.Repository)
+	payload, redactions, err := managed.NewRedactor().Evidence(managedPack)
 	if err != nil {
 		return domain.TelemetryOutcome{Status: "upload_failed", Reason: err.Error(), RetentionDays: 30}
 	}
@@ -835,6 +883,20 @@ func (p Planner) upload(ctx context.Context, policy domain.Policy, pack domain.E
 		return domain.TelemetryOutcome{Status: "upload_failed", Reason: err.Error(), Redactions: redactions, RetentionDays: 30}
 	}
 	return domain.TelemetryOutcome{Status: "uploaded", Redactions: redactions, RemoteID: remoteID, RetentionDays: 30}
+}
+
+func managedEvidencePack(pack domain.EvidencePack, repositoryIdentity string) domain.EvidencePack {
+	managedPack := pack
+	managedPack.Provenance.Repository = repositoryIdentity
+	managedPack.ProposedIntentPath = ""
+	managedPack.ReplayCapsules = slices.Clone(pack.ReplayCapsules)
+	for index := range managedPack.ReplayCapsules {
+		managedPack.ReplayCapsules[index].Environment = maps.Clone(pack.ReplayCapsules[index].Environment)
+		if _, ok := managedPack.ReplayCapsules[index].Environment["repository"]; ok {
+			managedPack.ReplayCapsules[index].Environment["repository"] = repositoryIdentity
+		}
+	}
+	return managedPack
 }
 
 func managedTimeout(policy domain.Policy, method string, fallback time.Duration) time.Duration {

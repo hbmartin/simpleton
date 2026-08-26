@@ -231,9 +231,30 @@ type Handler interface {
 	Probe(context.Context, ProbeParams) (ProbeResult, error)
 }
 
+type decodedRequest struct {
+	request RawRequest
+	err     error
+}
+
 func Serve(ctx context.Context, in io.Reader, out io.Writer, handler Handler) error {
 	dec := json.NewDecoder(bufio.NewReader(in))
 	enc := json.NewEncoder(out)
+	decoded := make(chan decodedRequest)
+	go func() {
+		defer close(decoded)
+		for {
+			var request RawRequest
+			err := dec.Decode(&request)
+			select {
+			case decoded <- decodedRequest{request: request, err: err}:
+			case <-ctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
 	var writeMu sync.Mutex
 	var inflightMu sync.Mutex
 	inflight := map[int64]context.CancelFunc{}
@@ -253,10 +274,25 @@ func Serve(ctx context.Context, in io.Reader, out io.Writer, handler Handler) er
 	}
 	for {
 		var request RawRequest
-		if err := dec.Decode(&request); err != nil {
-			if errors.Is(err, io.EOF) {
+		select {
+		case <-ctx.Done():
+			if closer, ok := in.(io.Closer); ok {
+				_ = closer.Close()
+			}
+			return ctx.Err()
+		case item, ok := <-decoded:
+			if !ok {
 				return nil
 			}
+			if item.err != nil {
+				if errors.Is(item.err, io.EOF) {
+					return nil
+				}
+				return item.err
+			}
+			request = item.request
+		}
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if request.JSONRPC != "2.0" {

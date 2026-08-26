@@ -3,12 +3,14 @@ package planner
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,6 +25,29 @@ import (
 type fakeRunner struct {
 	result execution.CommandResult
 	err    error
+}
+
+type sequenceRunner struct {
+	mu      sync.Mutex
+	results []execution.CommandResult
+	errors  []error
+	calls   int
+}
+
+func (r *sequenceRunner) Run(context.Context, string, domain.ExecutionPolicy, string, []string) (execution.CommandResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	index := r.calls
+	r.calls++
+	var result execution.CommandResult
+	var err error
+	if index < len(r.results) {
+		result = r.results[index]
+	}
+	if index < len(r.errors) {
+		err = r.errors[index]
+	}
+	return result, err
 }
 
 type deadlineRunner struct{}
@@ -48,8 +73,12 @@ func TestAnalyzeProposesIntentAndCanStillBlockBuildRegression(t *testing.T) {
 		t.Fatal(err)
 	}
 	output := filepath.Join(t.TempDir(), "run")
+	runner := &sequenceRunner{results: []execution.CommandResult{
+		{},
+		{ExitCode: 1, Stderr: "compile failed"},
+	}}
 	planner := Planner{
-		Runner: fakeRunner{result: execution.CommandResult{ExitCode: 1, Stderr: "compile failed"}},
+		Runner: runner,
 		Now:    func() time.Time { return time.Unix(10, 0) },
 	}
 	result, err := planner.Analyze(context.Background(), Request{
@@ -74,6 +103,34 @@ func TestAnalyzeProposesIntentAndCanStillBlockBuildRegression(t *testing.T) {
 	}
 }
 
+func TestPolicyCommandRequiresPassingBaseline(t *testing.T) {
+	policy := config.DefaultPolicy()
+	policy.Mode = "blocking"
+	policy.Commands = []domain.CommandSpec{{
+		ID: "tests", Category: domain.CategoryTestRegression, Command: []string{"test"}, Image: "image@sha256:abc",
+	}}
+	runner := &sequenceRunner{results: []execution.CommandResult{{ExitCode: 1, Stderr: "already failing"}}}
+	methods := (Planner{Runner: runner}).runCommands(context.Background(), "/baseline", "/candidate", policy)
+	if len(methods) != 1 || methods[0].Status != domain.StatusInconclusive || len(methods[0].Findings) != 0 {
+		t.Fatalf("baseline failure was promoted as a regression: %#v", methods)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("candidate should not run when the baseline is not a usable oracle: calls=%d", runner.calls)
+	}
+}
+
+func TestPolicyCommandInfrastructureExitCannotBecomeFinding(t *testing.T) {
+	policy := config.DefaultPolicy()
+	policy.Commands = []domain.CommandSpec{{
+		ID: "build", Category: domain.CategoryBuildRegression, Command: []string{"build"}, Image: "image@sha256:abc",
+	}}
+	runner := &sequenceRunner{results: []execution.CommandResult{{}, {ExitCode: 125, Stderr: "daemon unavailable"}}}
+	methods := (Planner{Runner: runner}).runCommands(context.Background(), "/baseline", "/candidate", policy)
+	if len(methods) != 1 || methods[0].Status != domain.StatusExecutionFailed || len(methods[0].Findings) != 0 {
+		t.Fatalf("infrastructure exit was promoted as a regression: %#v", methods)
+	}
+}
+
 func TestBudgetExhaustionCannotBlock(t *testing.T) {
 	repository, base, head := testRepository(t, "before\n", "after\n")
 	policy := config.DefaultPolicy()
@@ -91,6 +148,45 @@ func TestBudgetExhaustionCannotBlock(t *testing.T) {
 	}
 	if result.ExitCode != 0 || len(result.Pack.Blockers) != 0 || result.Pack.Methods[1].Status != domain.StatusBudgetExhausted {
 		t.Fatalf("budget exhaustion must be nonblocking: %#v", result)
+	}
+}
+
+func TestHardCeilingStillAllowsEvidenceFinalization(t *testing.T) {
+	repository, base, _ := testRepository(t, "before\n", "after\n")
+	if err := os.WriteFile(filepath.Join(repository, "sample.go"), []byte("package sample\n\nfunc Value() int { return 1 }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repository, "add", "sample.go")
+	runGit(t, repository, "commit", "-qm", "add Go source")
+	head := runGit(t, repository, "rev-parse", "HEAD")
+	policy := config.DefaultPolicy()
+	policy.Budgets.Total = domain.Duration(2 * time.Second)
+	policy.Budgets.HardCeiling = domain.Duration(2 * time.Second)
+	policy.Packs["go"] = domain.PackCommand{Command: []string{"/bin/sh", "-c", "exec sleep 60"}}
+	policy.Telemetry.Enabled = true
+	policy.Telemetry.OrgAdminOptIn = true
+	policy.Telemetry.Organization = "acme"
+	policy.Telemetry.Repository = "acme/repo"
+	policy.Telemetry.AllowedRepos = []string{"acme/repo"}
+	policyPath := filepath.Join(t.TempDir(), "policy.yaml")
+	if err := config.WriteYAML(policyPath, policy); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(t.TempDir(), "run")
+	result, err := (Planner{}).Analyze(context.Background(), Request{
+		Repository: repository, Base: base, Head: head, Output: output, PolicyPath: policyPath, CoreVersion: "test",
+	})
+	if err != nil {
+		t.Fatalf("hard-ceiling exhaustion should finalize evidence: %v", err)
+	}
+	if len(result.Pack.Methods) < 2 || result.Pack.Methods[1].Status != domain.StatusBudgetExhausted {
+		t.Fatalf("hard-ceiling status was not preserved: %#v", result.Pack.Methods)
+	}
+	if result.EvidenceDigest == "" {
+		t.Fatal("finalized evidence has no digest")
+	}
+	if result.Pack.AdvisoryReview.Status != domain.StatusBudgetExhausted || result.Pack.Telemetry.Status != "not_uploaded" {
+		t.Fatalf("hard-ceiling finalization attempted managed work: review=%#v telemetry=%#v", result.Pack.AdvisoryReview, result.Pack.Telemetry)
 	}
 }
 
@@ -189,16 +285,19 @@ func TestManagedCallsUsePostExecutionContexts(t *testing.T) {
 	repository, base, head := testRepository(t, "before\n", "after\n")
 	output := filepath.Join(t.TempDir(), "run")
 	var localEvidencePresent atomic.Bool
+	var uploadedPayload atomic.Value
 	fmServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
 		if _, err := fmt.Fprint(response, `{"explanation":"reviewed","suspicion":"low"}`); err != nil {
 			t.Errorf("write managed FM response: %v", err)
 		}
 	}))
 	defer fmServer.Close()
-	telemetryServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+	telemetryServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if _, err := os.Stat(filepath.Join(output, "evidence-pack.json")); err == nil {
 			localEvidencePresent.Store(true)
 		}
+		body, _ := io.ReadAll(request.Body)
+		uploadedPayload.Store(string(body))
 		if _, err := fmt.Fprint(response, `{"id":"remote-evidence"}`); err != nil {
 			t.Errorf("write telemetry response: %v", err)
 		}
@@ -233,6 +332,10 @@ func TestManagedCallsUsePostExecutionContexts(t *testing.T) {
 	}
 	if !localEvidencePresent.Load() {
 		t.Fatal("telemetry upload happened before evidence was persisted locally")
+	}
+	payload, _ := uploadedPayload.Load().(string)
+	if strings.Contains(payload, repository) || strings.Contains(payload, output) || !strings.Contains(payload, `"repository":"acme/repo"`) {
+		t.Fatalf("managed payload exposed local paths or lost repository identity: %s", payload)
 	}
 }
 
