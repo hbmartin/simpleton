@@ -23,6 +23,10 @@ type Store struct {
 }
 
 func Open(root string) (*Store, error) {
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, err
 	}

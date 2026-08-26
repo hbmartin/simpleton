@@ -75,6 +75,43 @@ func TestFilesAtReadsMultipleBlobsInOneBatch(t *testing.T) {
 	}
 }
 
+func TestFilesAtRejectsRevisionLineBreaksBeforePaths(t *testing.T) {
+	_, err := (Repository{}).FilesAt(context.Background(), "HEAD\nsecond-request", []string{"/absolute"})
+	if err == nil || !strings.Contains(err.Error(), "revision") {
+		t.Fatalf("revision line break was not rejected first: %v", err)
+	}
+	_, err = (Repository{}).FilesAt(context.Background(), "HEAD\x00second-request", []string{"relative"})
+	if err == nil || !strings.Contains(err.Error(), "revision") {
+		t.Fatalf("revision NUL was not rejected: %v", err)
+	}
+}
+
+func TestFilesAtOmitsIndividualNonBlobAndMissingPath(t *testing.T) {
+	path := t.TempDir()
+	gitCommand(t, path, "init", "-q")
+	gitCommand(t, path, "config", "user.email", "simpleton@example.invalid")
+	gitCommand(t, path, "config", "user.name", "Simpleton Test")
+	if err := os.Mkdir(filepath.Join(path, "directory"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "directory", "value.txt"), []byte("value"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, path, "add", ".")
+	gitCommand(t, path, "commit", "-qm", "sample")
+	repository, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := repository.FilesAt(context.Background(), "HEAD", []string{"directory", "missing\n.txt", "directory/value.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || string(files["directory/value.txt"]) != "value" {
+		t.Fatalf("per-path failures affected valid blobs: %#v", files)
+	}
+}
+
 func TestWorktreeDigestHashesDanglingSymlinkTarget(t *testing.T) {
 	path := t.TempDir()
 	gitCommand(t, path, "init", "-q")
@@ -168,6 +205,29 @@ func TestWorktreeDigestIncludesNestedRepositoryState(t *testing.T) {
 	second, err := repository.WorktreeDigest(context.Background())
 	if err != nil || first == second {
 		t.Fatalf("nested repository state did not affect digest: first=%s second=%s err=%v", first, second, err)
+	}
+}
+
+func TestWorktreeDigestRejectsOrdinaryUntrackedDirectory(t *testing.T) {
+	path := t.TempDir()
+	gitCommand(t, path, "init", "-q")
+	gitCommand(t, path, "config", "user.email", "simpleton@example.invalid")
+	gitCommand(t, path, "config", "user.name", "Simpleton Test")
+	if err := os.WriteFile(filepath.Join(path, "tracked.txt"), []byte("tracked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, path, "add", ".")
+	gitCommand(t, path, "commit", "-qm", "base")
+	if err := os.Mkdir(filepath.Join(path, "ordinary"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "ordinary", "value.txt"), []byte("untracked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var digest bytes.Buffer
+	err := writeWorktreeEntry(context.Background(), &digest, filepath.Join(path, "ordinary"), worktreeDigestLimits{maxFileBytes: 1024, maxNestedDepth: 1}, 0)
+	if err == nil || !strings.Contains(err.Error(), "independent repository root") {
+		t.Fatalf("ordinary directory was treated as a nested repository: %v", err)
 	}
 }
 

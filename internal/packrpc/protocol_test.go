@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,6 +18,30 @@ import (
 type testHandler struct {
 	cancelled atomic.Bool
 }
+
+type closeTrackingReader struct {
+	io.Reader
+	closed  atomic.Bool
+	started chan struct{}
+	once    sync.Once
+}
+
+func (r *closeTrackingReader) Read(buffer []byte) (int, error) {
+	r.once.Do(func() { close(r.started) })
+	return r.Reader.Read(buffer)
+}
+
+func (r *closeTrackingReader) Close() error {
+	r.closed.Store(true)
+	if closer, ok := r.Reader.(io.Closer); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
+type failingWriter struct{ err error }
+
+func (w failingWriter) Write([]byte) (int, error) { return 0, w.err }
 
 func (*testHandler) Capability() domain.PackCapability {
 	return domain.PackCapability{Language: "test", ProtocolVersion: domain.ProtocolVersion}
@@ -74,12 +99,14 @@ func TestCancelCancelsInflightRequest(t *testing.T) {
 
 func TestServeReturnsWhenContextIsCancelledWhileInputIsIdle(t *testing.T) {
 	reader, writer := io.Pipe()
-	defer writer.Close()
+	defer func() { _ = writer.Close() }()
+	tracked := &closeTrackingReader{Reader: reader, started: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
 	returned := make(chan error, 1)
 	go func() {
-		returned <- Serve(ctx, reader, io.Discard, &testHandler{})
+		returned <- Serve(ctx, tracked, io.Discard, &testHandler{})
 	}()
+	<-tracked.started
 	cancel()
 	select {
 	case err := <-returned:
@@ -88,6 +115,34 @@ func TestServeReturnsWhenContextIsCancelledWhileInputIsIdle(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Serve remained blocked decoding idle input after cancellation")
+	}
+	if !tracked.closed.Load() {
+		t.Fatal("Serve did not release the idle decoder input")
+	}
+}
+
+func TestServeReleasesDecoderAfterWriteFailure(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer func() { _ = writer.Close() }()
+	tracked := &closeTrackingReader{Reader: reader, started: make(chan struct{})}
+	writeErr := errors.New("output unavailable")
+	returned := make(chan error, 1)
+	go func() {
+		returned <- Serve(context.Background(), tracked, failingWriter{err: writeErr}, &testHandler{})
+	}()
+	if _, err := io.WriteString(writer, "{\"jsonrpc\":\"invalid\",\"id\":1}\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-returned:
+		if !errors.Is(err, writeErr) {
+			t.Fatalf("Serve returned the wrong write error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not return after its output failed")
+	}
+	if !tracked.closed.Load() {
+		t.Fatal("Serve leaked the decoder input after returning")
 	}
 }
 

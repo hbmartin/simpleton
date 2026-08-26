@@ -86,7 +86,17 @@ def analyze(params: dict[str, Any]) -> dict[str, Any]:
             trees[file] = tree
         except (OSError, UnicodeError, SyntaxError, subprocess.CalledProcessError):
             continue
-    callers = collect_callers(trees, changed)
+    targets_by_name: defaultdict[str, list[str]] = defaultdict(list)
+    for file in sorted(changed):
+        tree = trees.get(file)
+        if tree is None:
+            continue
+        for node, symbol in qualified_functions(tree):
+            targets_by_name[node.name].append(symbol)
+    unambiguous_targets = {
+        name: symbols[0] for name, symbols in targets_by_name.items() if len(symbols) == 1
+    }
+    callers = collect_callers(trees, changed, unambiguous_targets)
     targets: list[dict[str, Any]] = []
     opportunities: list[dict[str, Any]] = []
     for file in sorted(changed):
@@ -104,7 +114,7 @@ def analyze(params: dict[str, Any]) -> dict[str, Any]:
                     "generated": False,
                     "confidence": 0.78,
                 }
-                for caller in callers.get(node.name, [])
+                for caller in callers.get(symbol, [])
             ]
             if not node.name.startswith("_"):
                 boundaries.append(
@@ -220,20 +230,32 @@ def qualified_functions(
 
 
 def collect_callers(
-    trees: dict[str, ast.Module], changed: set[str]
+    trees: dict[str, ast.Module],
+    changed: set[str],
+    unambiguous_targets: dict[str, str],
 ) -> dict[str, list[dict[str, str]]]:
     callers: defaultdict[str, list[dict[str, str]]] = defaultdict(list)
     for file, tree in trees.items():
         if file in changed:
             continue
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for child in ast.walk(node):
-                if isinstance(child, ast.Call):
-                    name = called_name(child.func)
-                    if name:
-                        callers[name].append({"path": file, "symbol": node.name})
+        for function, caller_symbol in qualified_functions(tree):
+            class CallVisitor(ast.NodeVisitor):
+                def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                    if node is function:
+                        self.generic_visit(node)
+
+                def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                    if node is function:
+                        self.generic_visit(node)
+
+                def visit_Call(self, node: ast.Call) -> None:
+                    name = called_name(node.func)
+                    target = unambiguous_targets.get(name)
+                    if target:
+                        callers[target].append({"path": file, "symbol": caller_symbol})
+                    self.generic_visit(node)
+
+            CallVisitor().visit(function)
     return callers
 
 

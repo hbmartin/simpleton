@@ -15,7 +15,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
+
+const filesystemRetryDelay = 10 * time.Millisecond
 
 type ChangedFile struct {
 	Status   string `json:"status"`
@@ -112,6 +115,9 @@ func (r Repository) FileAt(ctx context.Context, revision, path string) ([]byte, 
 // FilesAt reads repository blobs through one git cat-file batch process. The
 // returned map omits paths that do not resolve to blobs at the revision.
 func (r Repository) FilesAt(ctx context.Context, revision string, paths []string) (map[string][]byte, error) {
+	if strings.ContainsAny(revision, "\x00\r\n") {
+		return nil, errors.New("git revision must contain no NUL, carriage returns, or newlines")
+	}
 	result := make(map[string][]byte, len(paths))
 	batchPaths := make([]string, 0, len(paths))
 	var input strings.Builder
@@ -122,7 +128,10 @@ func (r Repository) FilesAt(ctx context.Context, revision string, paths []string
 		if strings.ContainsAny(path, "\r\n") {
 			content, err := r.FileAt(ctx, revision, path)
 			if err != nil {
-				return nil, err
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				continue
 			}
 			result[path] = content
 			continue
@@ -140,40 +149,69 @@ func (r Repository) FilesAt(ctx context.Context, revision string, paths []string
 	cmd.Stdin = strings.NewReader(input.String())
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	output, err := cmd.Output()
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		message := strings.TrimSpace(stderr.String())
-		if message == "" {
-			message = err.Error()
-		}
-		return nil, fmt.Errorf("git cat-file --batch: %s", message)
+		return nil, fmt.Errorf("open git cat-file --batch output: %w", err)
 	}
-	reader := bufio.NewReader(bytes.NewReader(output))
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start git cat-file --batch: %w", err)
+	}
+	abort := func(cause error) (map[string][]byte, error) {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+		return nil, cause
+	}
+	reader := bufio.NewReader(stdout)
 	for _, path := range batchPaths {
 		header, err := reader.ReadString('\n')
 		if err != nil {
-			return nil, fmt.Errorf("read git cat-file header for %q: %w", path, err)
+			if ctx.Err() != nil {
+				return abort(ctx.Err())
+			}
+			return abort(fmt.Errorf("read git cat-file header for %q: %w", path, err))
 		}
 		fields := strings.Fields(strings.TrimSuffix(header, "\n"))
 		if len(fields) >= 2 && fields[len(fields)-1] == "missing" {
 			continue
 		}
-		if len(fields) < 3 || fields[len(fields)-2] != "blob" {
-			return nil, fmt.Errorf("unexpected git cat-file header for %q: %q", path, strings.TrimSpace(header))
+		if len(fields) < 3 {
+			return abort(fmt.Errorf("unexpected git cat-file header for %q: %q", path, strings.TrimSpace(header)))
 		}
 		size, err := strconv.ParseInt(fields[len(fields)-1], 10, 64)
-		if err != nil || size < 0 || size > int64(int(^uint(0)>>1)) {
-			return nil, fmt.Errorf("invalid git blob size for %q: %q", path, fields[len(fields)-1])
+		if err != nil || size < 0 {
+			return abort(fmt.Errorf("invalid git object size for %q: %q", path, fields[len(fields)-1]))
+		}
+		if fields[len(fields)-2] != "blob" {
+			if _, err := io.CopyN(io.Discard, reader, size); err != nil {
+				return abort(fmt.Errorf("discard non-blob git object for %q: %w", path, err))
+			}
+			separator, err := reader.ReadByte()
+			if err != nil || separator != '\n' {
+				return abort(fmt.Errorf("invalid git object delimiter for %q", path))
+			}
+			continue
+		}
+		if size > int64(int(^uint(0)>>1)) {
+			return abort(fmt.Errorf("git blob for %q is too large: %d", path, size))
 		}
 		content := make([]byte, int(size))
 		if _, err := io.ReadFull(reader, content); err != nil {
-			return nil, fmt.Errorf("read git blob for %q: %w", path, err)
+			return abort(fmt.Errorf("read git blob for %q: %w", path, err))
 		}
 		separator, err := reader.ReadByte()
 		if err != nil || separator != '\n' {
-			return nil, fmt.Errorf("invalid git blob delimiter for %q", path)
+			return abort(fmt.Errorf("invalid git blob delimiter for %q", path))
 		}
 		result[path] = content
+	}
+	if err := cmd.Wait(); err != nil {
+		message := strings.TrimSpace(stderr.String())
+		if message == "" {
+			message = err.Error()
+		}
+		return nil, fmt.Errorf("git cat-file --batch: %s", message)
 	}
 	return result, nil
 }
@@ -271,12 +309,20 @@ func writeWorktreeEntry(ctx context.Context, writer io.Writer, path string, limi
 		return nil
 	}
 	if info.IsDir() {
+		nested := Repository{Path: path}
+		topLevel, err := nested.run(ctx, "rev-parse", "--show-toplevel")
+		if err != nil {
+			return fmt.Errorf("unsupported directory entry: %w", err)
+		}
+		matches, err := pathsResolveEqual(path, strings.TrimRight(string(topLevel), "\r\n"))
+		if err != nil {
+			return fmt.Errorf("resolve nested repository root: %w", err)
+		}
+		if !matches {
+			return errors.New("unsupported directory entry: directory is not an independent repository root")
+		}
 		if depth >= limits.maxNestedDepth {
 			return fmt.Errorf("nested repository depth exceeds %d", limits.maxNestedDepth)
-		}
-		nested := Repository{Path: path}
-		if _, err := nested.run(ctx, "rev-parse", "--git-dir"); err != nil {
-			return fmt.Errorf("unsupported directory entry: %w", err)
 		}
 		head, err := nested.run(ctx, "rev-parse", "--verify", "HEAD")
 		if err != nil {
@@ -320,6 +366,11 @@ func digestRegularFile(ctx context.Context, path string, maxBytes int64) ([]byte
 			return nil, 0, ctx.Err()
 		}
 		lastErr = err
+		if attempt < 2 {
+			if err := waitForFilesystemRetry(ctx); err != nil {
+				return nil, 0, err
+			}
+		}
 	}
 	return nil, 0, fmt.Errorf("file remained unreadable after 3 attempts: %w", lastErr)
 }
@@ -329,7 +380,7 @@ func digestRegularFileOnce(ctx context.Context, path string, maxBytes int64) ([]
 	if err != nil {
 		return nil, 0, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	before, err := file.Stat()
 	if err != nil {
 		return nil, 0, err
@@ -380,6 +431,11 @@ func lstatWithRetry(ctx context.Context, path string) (os.FileInfo, error) {
 			return info, nil
 		}
 		lastErr = err
+		if attempt < 2 {
+			if err := waitForFilesystemRetry(ctx); err != nil {
+				return nil, err
+			}
+		}
 	}
 	return nil, fmt.Errorf("lstat failed after 3 attempts: %w", lastErr)
 }
@@ -395,8 +451,43 @@ func readlinkWithRetry(ctx context.Context, path string) (string, error) {
 			return target, nil
 		}
 		lastErr = err
+		if attempt < 2 {
+			if err := waitForFilesystemRetry(ctx); err != nil {
+				return "", err
+			}
+		}
 	}
 	return "", fmt.Errorf("readlink failed after 3 attempts: %w", lastErr)
+}
+
+func pathsResolveEqual(left, right string) (bool, error) {
+	resolve := func(path string) (string, error) {
+		absolute, err := filepath.Abs(filepath.Clean(path))
+		if err != nil {
+			return "", err
+		}
+		return filepath.EvalSymlinks(absolute)
+	}
+	resolvedLeft, err := resolve(left)
+	if err != nil {
+		return false, err
+	}
+	resolvedRight, err := resolve(right)
+	if err != nil {
+		return false, err
+	}
+	return filepath.Clean(resolvedLeft) == filepath.Clean(resolvedRight), nil
+}
+
+func waitForFilesystemRetry(ctx context.Context) error {
+	timer := time.NewTimer(filesystemRetryDelay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (r Repository) DetachedWorktree(ctx context.Context, revision string) (string, func() error, error) {

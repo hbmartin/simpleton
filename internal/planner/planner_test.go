@@ -2,6 +2,7 @@ package planner
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -59,6 +61,19 @@ func (deadlineRunner) Run(ctx context.Context, _ string, _ domain.ExecutionPolic
 
 func (f fakeRunner) Run(context.Context, string, domain.ExecutionPolicy, string, []string) (execution.CommandResult, error) {
 	return f.result, f.err
+}
+
+type independentContextRunner struct {
+	contexts                      []context.Context
+	baselineCancelledBeforeSecond bool
+}
+
+func (r *independentContextRunner) Run(ctx context.Context, _ string, _ domain.ExecutionPolicy, _ string, _ []string) (execution.CommandResult, error) {
+	if len(r.contexts) == 1 {
+		r.baselineCancelledBeforeSecond = r.contexts[0].Err() != nil
+	}
+	r.contexts = append(r.contexts, ctx)
+	return execution.CommandResult{}, nil
 }
 
 func TestAnalyzeProposesIntentAndCanStillBlockBuildRegression(t *testing.T) {
@@ -128,6 +143,48 @@ func TestPolicyCommandInfrastructureExitCannotBecomeFinding(t *testing.T) {
 	methods := (Planner{Runner: runner}).runCommands(context.Background(), "/baseline", "/candidate", policy)
 	if len(methods) != 1 || methods[0].Status != domain.StatusExecutionFailed || len(methods[0].Findings) != 0 {
 		t.Fatalf("infrastructure exit was promoted as a regression: %#v", methods)
+	}
+}
+
+func TestPolicyCommandExecutionsUseIndependentTimeouts(t *testing.T) {
+	policy := config.DefaultPolicy()
+	policy.Commands = []domain.CommandSpec{{
+		ID: "tests", Category: domain.CategoryTestRegression, Command: []string{"test"}, Image: "image@sha256:abc",
+	}}
+	runner := &independentContextRunner{}
+	methods := (Planner{Runner: runner}).runCommands(context.Background(), "/baseline", "/candidate", policy)
+	if len(methods) != 1 || methods[0].Status != domain.StatusRan {
+		t.Fatalf("unexpected command result: %#v", methods)
+	}
+	if len(runner.contexts) != 2 || runner.contexts[0] == runner.contexts[1] || !runner.baselineCancelledBeforeSecond {
+		t.Fatalf("baseline and candidate did not receive independent timeout windows: %#v", runner)
+	}
+}
+
+func TestMatchingTargetSupportsUniqueLegacyMethodNames(t *testing.T) {
+	reference := domain.TargetRef{Language: "python", ScopeType: "symbol", Path: "sample.py", Symbol: "same"}
+	targets := []domain.VerificationTarget{{
+		ID: "first", Language: "python", ScopeType: "symbol", File: "sample.py", Symbol: "First.same",
+	}}
+	target, found := matchingTarget(reference, targets)
+	if !found || target.ID != "first" {
+		t.Fatalf("unique legacy method name did not match its qualified target: target=%#v found=%t", target, found)
+	}
+	targets = append(targets, domain.VerificationTarget{
+		ID: "second", Language: "python", ScopeType: "symbol", File: "sample.py", Symbol: "Second.same",
+	})
+	if target, found := matchingTarget(reference, targets); found {
+		t.Fatalf("ambiguous legacy method name matched arbitrarily: %#v", target)
+	}
+}
+
+func TestCachePackVersionsIncludeNegotiatedPackVersions(t *testing.T) {
+	versions := cachePackVersions([]domain.PackCapability{
+		{Language: "python", PackVersion: "0.1.1"},
+		{Language: "typescript", PackVersion: "0.2.0"},
+	})
+	if versions["protocol"] != domain.ProtocolVersion || versions["python"] != "0.1.1" || versions["typescript"] != "0.2.0" {
+		t.Fatalf("cache versions omitted negotiated capabilities: %#v", versions)
 	}
 }
 
@@ -284,9 +341,13 @@ func TestReplayCapsuleRequiresCoreIssuedSeed(t *testing.T) {
 func TestManagedCallsUsePostExecutionContexts(t *testing.T) {
 	repository, base, head := testRepository(t, "before\n", "after\n")
 	output := filepath.Join(t.TempDir(), "run")
+	rawDiagnostic := "raw-managed-diagnostic " + filepath.Join(repository, "private", "source.go")
 	var localEvidencePresent atomic.Bool
+	var managedFMRequest atomic.Value
 	var uploadedPayload atomic.Value
-	fmServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+	fmServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		body, _ := io.ReadAll(request.Body)
+		managedFMRequest.Store(string(body))
 		if _, err := fmt.Fprint(response, `{"explanation":"reviewed","suspicion":"low"}`); err != nil {
 			t.Errorf("write managed FM response: %v", err)
 		}
@@ -304,7 +365,7 @@ func TestManagedCallsUsePostExecutionContexts(t *testing.T) {
 	}))
 	defer telemetryServer.Close()
 	policy := config.DefaultPolicy()
-	policy.Budgets.Total = domain.Duration(time.Second)
+	policy.Budgets.Total = domain.Duration(30 * time.Second)
 	policy.Commands = []domain.CommandSpec{{
 		ID: "tests", Category: domain.CategoryTestRegression, Command: []string{"test"}, Image: "image@sha256:abc",
 	}}
@@ -318,7 +379,7 @@ func TestManagedCallsUsePostExecutionContexts(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := (Planner{
-		Runner:          deadlineRunner{},
+		Runner:          fakeRunner{err: fmt.Errorf("%s", rawDiagnostic)},
 		FMClient:        managed.FMClient{Endpoint: fmServer.URL, AllowInsecure: true},
 		TelemetryClient: managed.TelemetryClient{Endpoint: telemetryServer.URL, AllowInsecure: true},
 	}).Analyze(context.Background(), Request{
@@ -333,9 +394,125 @@ func TestManagedCallsUsePostExecutionContexts(t *testing.T) {
 	if !localEvidencePresent.Load() {
 		t.Fatal("telemetry upload happened before evidence was persisted locally")
 	}
+	localDiagnosticPresent := false
+	for _, method := range result.Pack.Methods {
+		localDiagnosticPresent = localDiagnosticPresent || strings.Contains(method.Reason, rawDiagnostic)
+	}
+	if !localDiagnosticPresent {
+		t.Fatal("managed sanitization removed the diagnostic from local evidence")
+	}
+	fmPayload, _ := managedFMRequest.Load().(string)
 	payload, _ := uploadedPayload.Load().(string)
-	if strings.Contains(payload, repository) || strings.Contains(payload, output) || !strings.Contains(payload, `"repository":"acme/repo"`) {
+	if strings.Contains(fmPayload, rawDiagnostic) || strings.Contains(fmPayload, repository) || strings.Contains(fmPayload, output) {
+		t.Fatalf("managed FM request exposed local diagnostics or paths: %s", fmPayload)
+	}
+	if strings.Contains(payload, rawDiagnostic) || strings.Contains(payload, repository) || strings.Contains(payload, output) || !strings.Contains(payload, `"repository":"acme/repo"`) {
 		t.Fatalf("managed payload exposed local paths or lost repository identity: %s", payload)
+	}
+}
+
+func TestManagedEvidencePackRemovesRawContentWithoutMutatingLocalEvidence(t *testing.T) {
+	posixPath := "/Users/alice/private/source.go"
+	windowsPath := `C:\Users\alice\private\source.go`
+	uncPath := `\\server\share\private\source.go`
+	raw := "raw-command-output"
+	pack := domain.EvidencePack{
+		SchemaVersion: raw,
+		RunID:         raw,
+		Provenance: domain.Provenance{
+			CoreVersion: raw, Repository: posixPath, BaseRevision: raw, TrustClass: raw,
+			LockfileDigests: map[string]string{raw: raw}, ToolVersions: map[string]string{raw: posixPath},
+		},
+		Approval: domain.ApprovalContext{Source: raw, RequiredOwner: raw, Reason: raw + " " + posixPath},
+		Capabilities: []domain.PackCapability{{
+			Language: raw, PackVersion: raw, ProtocolVersion: raw, Methods: map[string]bool{raw: true},
+			Requirements: map[string]string{raw: posixPath}, TrustClasses: []string{posixPath},
+		}},
+		Targets: []domain.VerificationTarget{{
+			ID: raw, Language: raw, Symbol: raw, Kind: raw, ScopeType: raw,
+			File: "src/value.go", BaselineArtifact: posixPath, CandidateArtifact: windowsPath,
+			Dependencies:          []string{"src/dependency.go", uncPath},
+			ObservationCandidates: []domain.ObservationBoundary{{Kind: raw, Symbol: raw, Path: uncPath}},
+			Applicability:         domain.RunApplicability{Reason: raw, Risks: []string{posixPath}},
+		}},
+		Methods: []domain.MethodResult{{
+			ID: raw, Language: raw, Status: domain.MethodStatus(raw), Budget: raw,
+			Reason:        raw + " " + posixPath,
+			Findings:      []domain.Finding{{ID: raw, Category: domain.FindingCategory(raw), Title: raw, Detail: windowsPath, Severity: raw, TargetID: raw, MethodID: raw}},
+			Applicability: &domain.RunApplicability{Reason: raw, Risks: []string{uncPath}},
+		}},
+		Divergences: []domain.ObservedDivergence{{
+			ID: raw, TargetID: raw, ObservationSpecID: raw, Status: domain.ObservationStatus(raw), Comparator: raw,
+			EnvironmentDigest: raw, BaselineArtifactDigest: raw, CandidateArtifactDigest: raw, ReplayCapsuleDigest: raw,
+			FixtureOrInput: map[string]any{posixPath: raw}, BeforeObservation: windowsPath, AfterObservation: uncPath,
+			PreconditionEvidence: []string{raw},
+		}},
+		Witnesses: []domain.BehavioralWitness{{
+			ID: raw, Divergence: domain.ObservedDivergence{ID: raw, BeforeObservation: posixPath},
+			DomainValidityEvidence: []string{raw}, ContractRelevanceStatus: raw, ApprovedContractDigest: raw,
+		}},
+		ReplayCapsules: []domain.ReplayCapsule{{
+			Digest: raw, ObjectDigests: []string{raw}, Environment: map[string]string{"repository": posixPath, "workspace": windowsPath},
+			ReplayCommand: []string{raw, uncPath}, Seed: raw, Comparator: raw,
+		}},
+		Scoping: domain.ScopingPack{SchemaVersion: raw, RunID: raw, Opportunities: []domain.Opportunity{{
+			ID: raw, Language: raw, Category: raw, Region: "src/value.go:Value", Evidence: []string{raw, posixPath}, AllowedFiles: []string{"src/value.go", windowsPath},
+		}}},
+		AdvisoryReview: domain.AdvisoryReview{Status: domain.MethodStatus(raw), ModelID: raw, PromptID: raw, Explanation: raw, Suspicion: raw, Reason: posixPath},
+		Telemetry:      domain.TelemetryOutcome{Status: raw, Reason: raw, RemoteID: raw},
+		Blockers:       []domain.Finding{{Title: raw, Detail: uncPath}},
+	}
+	before, err := json.Marshal(pack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositoryPaths := map[string]struct{}{"src/value.go": {}, "src/dependency.go": {}}
+	managedPack := managedEvidencePack(pack, "acme/repo", repositoryPaths)
+	after, err := json.Marshal(pack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("managed sanitization mutated the local evidence pack")
+	}
+	managedPayload, err := json.Marshal(managedPack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{raw, posixPath, windowsPath, uncPath} {
+		if strings.Contains(string(managedPayload), forbidden) {
+			t.Fatalf("managed evidence retained sensitive content %q: %s", forbidden, managedPayload)
+		}
+	}
+	if managedPack.Provenance.Repository != "acme/repo" || managedPack.Targets[0].File != "src/value.go" ||
+		len(managedPack.Targets[0].Dependencies) != 1 || managedPack.Targets[0].Dependencies[0] != "src/dependency.go" ||
+		managedPack.Scoping.Opportunities[0].Region != "" || len(managedPack.Scoping.Opportunities[0].AllowedFiles) != 1 {
+		t.Fatalf("managed sanitization removed safe structured evidence: %#v", managedPack)
+	}
+	if managedPath(posixPath, nil) != "" {
+		t.Fatalf("absolute path was not rejected: %q", posixPath)
+	}
+	for _, value := range []string{"file:///Users/alice/private/source.go", "file://localhost/C:/private/source.go"} {
+		if managedPath(value, nil) != "" {
+			t.Fatalf("file URI was not rejected: %q", value)
+		}
+	}
+	if runtime.GOOS == "windows" {
+		if managedPath("C:/src/value.go", nil) != "" {
+			t.Fatal("Windows absolute path was not rejected")
+		}
+	} else {
+		for _, value := range []string{"C:/src/value.go", `src\value.go`} {
+			if got := managedPath(value, nil); got != value {
+				t.Fatalf("valid POSIX Git path was changed: got %q, want %q", got, value)
+			}
+		}
+	}
+	if managedPath("https://example.invalid/path", nil) == "" {
+		t.Fatal("URL was mistaken for a local absolute path")
+	}
+	if managedPath("not-in-repository.go", repositoryPaths) != "" {
+		t.Fatal("pack-supplied path outside the repository tree was accepted")
 	}
 }
 

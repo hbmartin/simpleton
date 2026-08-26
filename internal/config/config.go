@@ -222,8 +222,11 @@ func TelemetryAllowed(policy domain.TelemetryPolicy) error {
 	if !policy.OrgAdminOptIn {
 		return errors.New("organization administrator has not opted in")
 	}
-	if policy.Repository == "" {
-		return errors.New("repository identity is missing")
+	if !validManagedOrganization(policy.Organization) {
+		return errors.New("managed organization identity is missing or invalid")
+	}
+	if !validManagedRepository(policy.Repository) {
+		return errors.New("managed repository identity is missing or invalid")
 	}
 	if !slices.Contains(policy.AllowedRepos, policy.Repository) {
 		return errors.New("repository is not allowlisted")
@@ -235,6 +238,37 @@ func TelemetryAllowed(policy domain.TelemetryPolicy) error {
 		return errors.New("training is not permitted by the base product policy")
 	}
 	return nil
+}
+
+func validManagedOrganization(value string) bool {
+	return validManagedIdentitySegment(value)
+}
+
+func validManagedRepository(value string) bool {
+	segments := strings.Split(value, "/")
+	if len(segments) < 2 {
+		return false
+	}
+	for _, segment := range segments {
+		if !validManagedIdentitySegment(segment) {
+			return false
+		}
+	}
+	return true
+}
+
+func validManagedIdentitySegment(value string) bool {
+	if value == "" || len(value) > 128 || value == "." || value == ".." {
+		return false
+	}
+	for _, character := range value {
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' || character == '-' || character == '_' || character == '.' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func decodeStrictFile(path string, out any) error {

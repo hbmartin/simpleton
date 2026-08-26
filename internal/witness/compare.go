@@ -14,6 +14,8 @@ import (
 	"github.com/haroldmartin/simpleton/internal/numeric"
 )
 
+const maxToleranceUnorderedItems = 256
+
 // ObservationPair is one baseline/candidate execution of an Observation Spec.
 // LegalInput and DomainEvidence are supplied by reviewed preconditions and
 // repository helpers; this package never guesses whether an input is legal.
@@ -361,46 +363,85 @@ func unorderedEqual(left, right []any, tolerances *domain.Tolerances) (bool, err
 		}
 		return reflect.DeepEqual(leftCanonical, rightCanonical), nil
 	}
-	matches := make([]int, len(right))
-	for index := range matches {
-		matches[index] = -1
+	if len(left) > maxToleranceUnorderedItems {
+		return false, fmt.Errorf("unordered tolerance matching supports at most %d items", maxToleranceUnorderedItems)
 	}
-	var augment func(int, []bool) (bool, error)
-	augment = func(leftIndex int, seen []bool) (bool, error) {
+	adjacency := make([][]int, len(left))
+	for leftIndex := range left {
 		for rightIndex := range right {
-			if seen[rightIndex] {
-				continue
-			}
 			equal, err := equalWithTolerance(left[leftIndex], right[rightIndex], tolerances)
 			if err != nil {
 				return false, err
 			}
-			if !equal {
-				continue
-			}
-			seen[rightIndex] = true
-			if matches[rightIndex] == -1 {
-				matches[rightIndex] = leftIndex
-				return true, nil
-			}
-			rematched, err := augment(matches[rightIndex], seen)
-			if err != nil {
-				return false, err
-			}
-			if rematched {
-				matches[rightIndex] = leftIndex
-				return true, nil
+			if equal {
+				adjacency[leftIndex] = append(adjacency[leftIndex], rightIndex)
 			}
 		}
-		return false, nil
-	}
-	for leftIndex := range left {
-		matched, err := augment(leftIndex, make([]bool, len(right)))
-		if err != nil || !matched {
-			return matched, err
+		if len(adjacency[leftIndex]) == 0 {
+			return false, nil
 		}
 	}
-	return true, nil
+	return hasPerfectMatching(adjacency, len(right)), nil
+}
+
+func hasPerfectMatching(adjacency [][]int, rightCount int) bool {
+	pairLeft := make([]int, len(adjacency))
+	pairRight := make([]int, rightCount)
+	distance := make([]int, len(adjacency))
+	for index := range pairLeft {
+		pairLeft[index] = -1
+	}
+	for index := range pairRight {
+		pairRight[index] = -1
+	}
+	breadthFirst := func() bool {
+		queue := make([]int, 0, len(adjacency))
+		for leftIndex := range adjacency {
+			if pairLeft[leftIndex] == -1 {
+				distance[leftIndex] = 0
+				queue = append(queue, leftIndex)
+			} else {
+				distance[leftIndex] = -1
+			}
+		}
+		found := false
+		for len(queue) > 0 {
+			leftIndex := queue[0]
+			queue = queue[1:]
+			for _, rightIndex := range adjacency[leftIndex] {
+				paired := pairRight[rightIndex]
+				if paired == -1 {
+					found = true
+				} else if distance[paired] == -1 {
+					distance[paired] = distance[leftIndex] + 1
+					queue = append(queue, paired)
+				}
+			}
+		}
+		return found
+	}
+	var depthFirst func(int) bool
+	depthFirst = func(leftIndex int) bool {
+		for _, rightIndex := range adjacency[leftIndex] {
+			paired := pairRight[rightIndex]
+			if paired == -1 || distance[paired] == distance[leftIndex]+1 && depthFirst(paired) {
+				pairLeft[leftIndex] = rightIndex
+				pairRight[rightIndex] = leftIndex
+				return true
+			}
+		}
+		distance[leftIndex] = -1
+		return false
+	}
+	matched := 0
+	for breadthFirst() {
+		for leftIndex := range adjacency {
+			if pairLeft[leftIndex] == -1 && depthFirst(leftIndex) {
+				matched++
+			}
+		}
+	}
+	return matched == len(adjacency)
 }
 
 func canonicalItems(items []any) ([]string, error) {

@@ -85,6 +85,7 @@ func TestTelemetryRequiresAllowlistedRepository(t *testing.T) {
 	policy := DefaultPolicy().Telemetry
 	policy.Enabled = true
 	policy.OrgAdminOptIn = true
+	policy.Organization = "org"
 	policy.Repository = "org/repo"
 	if err := TelemetryAllowed(policy); err == nil {
 		t.Fatal("non-allowlisted repository must be rejected")
@@ -92,5 +93,42 @@ func TestTelemetryRequiresAllowlistedRepository(t *testing.T) {
 	policy.AllowedRepos = []string{"org/repo"}
 	if err := TelemetryAllowed(policy); err != nil {
 		t.Fatalf("allowlisted repository rejected: %v", err)
+	}
+}
+
+func TestTelemetryRejectsUnsafeManagedIdentities(t *testing.T) {
+	base := DefaultPolicy().Telemetry
+	base.Enabled = true
+	base.OrgAdminOptIn = true
+	base.Organization = "org"
+	base.Repository = "org/repo"
+	base.AllowedRepos = []string{"org/repo"}
+	if err := TelemetryAllowed(base); err != nil {
+		t.Fatalf("valid managed identities rejected: %v", err)
+	}
+
+	for _, test := range []struct {
+		name         string
+		organization string
+		repository   string
+	}{
+		{name: "missing organization", organization: "", repository: "org/repo"},
+		{name: "organization path", organization: "/private/org", repository: "org/repo"},
+		{name: "organization control character", organization: "org\nprivate", repository: "org/repo"},
+		{name: "absolute repository", organization: "org", repository: "/private/repo"},
+		{name: "file URI repository", organization: "org", repository: "file:///private/repo"},
+		{name: "Windows repository path", organization: "org", repository: `C:\private\repo`},
+		{name: "repository traversal", organization: "org", repository: "org/../repo"},
+		{name: "repository control character", organization: "org", repository: "org/repo\nprivate"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			policy := base
+			policy.Organization = test.organization
+			policy.Repository = test.repository
+			policy.AllowedRepos = []string{test.repository}
+			if err := TelemetryAllowed(policy); err == nil {
+				t.Fatal("unsafe managed identity was accepted")
+			}
+		})
 	}
 }

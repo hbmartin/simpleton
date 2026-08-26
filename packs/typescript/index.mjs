@@ -79,15 +79,28 @@ function analyze(params) {
   const typeDiagnostics = ts.getPreEmitDiagnostics(program).filter((diagnostic) =>
     diagnostic.category === ts.DiagnosticCategory.Error && diagnostic.file && !slash(path.relative(repo, diagnostic.file.fileName)).startsWith("..")
   );
-  const callers = collectCallers(program, repo, changed);
+  const targetsByCalledName = new Map();
+  for (const source of program.getSourceFiles()) {
+    const relative = slash(path.relative(repo, source.fileName));
+    if (!changed.has(relative)) continue;
+    visitFunctions(source, (_node, name, calledName) => {
+      const names = targetsByCalledName.get(calledName) ?? [];
+      names.push(name);
+      targetsByCalledName.set(calledName, names);
+    });
+  }
+  const unambiguousTargets = new Map(
+    [...targetsByCalledName].filter(([, names]) => names.length === 1).map(([calledName, names]) => [calledName, names[0]]),
+  );
+  const callers = collectCallers(program, repo, changed, unambiguousTargets);
   const targets = [];
   const opportunities = [];
   for (const source of program.getSourceFiles()) {
     const relative = slash(path.relative(repo, source.fileName));
     if (!changed.has(relative)) continue;
-    visitFunctions(source, (node, name, calledName) => {
-		const risks = effectRisks(node, source);
-		const boundaries = (callers.get(calledName) ?? []).map((caller) => ({
+    visitFunctions(source, (node, name) => {
+      const risks = effectRisks(node, source);
+      const boundaries = (callers.get(name) ?? []).map((caller) => ({
         kind: "unchanged_caller", symbol: caller.symbol, path: caller.path, stable: true, generated: false, confidence: 0.82,
       }));
       if (isExported(node)) boundaries.push({ kind: "public_api", symbol: name, path: relative, stable: true, generated: false, confidence: 0.75 });
@@ -141,7 +154,7 @@ function showFile(repo, revision, file) {
   return execFileSync("git", ["-C", repo, "show", `${revision}:${file}`], { encoding: "utf8", maxBuffer: MAX_GIT_OUTPUT });
 }
 
-function collectCallers(program, repo, changed) {
+function collectCallers(program, repo, changed, unambiguousTargets) {
   const callers = new Map();
   for (const source of program.getSourceFiles()) {
     const relative = slash(path.relative(repo, source.fileName));
@@ -149,7 +162,10 @@ function collectCallers(program, repo, changed) {
     const visit = (node, scope = [], enclosing = "<module>") => {
       let childScope = scope;
       let childEnclosing = enclosing;
-      if (isClassLike(node) && node.name && ts.isIdentifier(node.name)) childScope = [...scope, node.name.text];
+      if (isClassLike(node)) {
+        const name = className(node);
+        if (name) childScope = [...scope, name];
+      }
       if (isFunctionLike(node)) {
         const name = functionName(node);
         if (name) {
@@ -159,10 +175,11 @@ function collectCallers(program, repo, changed) {
       }
       if (ts.isCallExpression(node)) {
         const name = calledName(node.expression);
-        if (name) {
-          const entries = callers.get(name) ?? [];
+        const target = unambiguousTargets.get(name);
+        if (target) {
+          const entries = callers.get(target) ?? [];
           entries.push({ path: relative, symbol: childEnclosing });
-          callers.set(name, entries);
+          callers.set(target, entries);
         }
       }
       ts.forEachChild(node, (child) => visit(child, childScope, childEnclosing));
@@ -175,7 +192,10 @@ function collectCallers(program, repo, changed) {
 function visitFunctions(source, callback) {
   const visit = (node, scope = []) => {
     let childScope = scope;
-    if (isClassLike(node) && node.name && ts.isIdentifier(node.name)) childScope = [...scope, node.name.text];
+    if (isClassLike(node)) {
+      const name = className(node);
+      if (name) childScope = [...scope, name];
+    }
     if (isFunctionLike(node)) {
       const calledName = functionName(node);
       if (calledName) {
@@ -195,6 +215,12 @@ function isFunctionLike(node) {
 
 function isClassLike(node) {
   return ts.isClassDeclaration(node) || ts.isClassExpression(node);
+}
+
+function className(node) {
+  if (node.name && ts.isIdentifier(node.name)) return node.name.text;
+  if (node.parent && ts.isVariableDeclaration(node.parent) && ts.isIdentifier(node.parent.name)) return node.parent.name.text;
+  return "";
 }
 
 function functionName(node) {
