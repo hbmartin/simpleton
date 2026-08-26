@@ -98,6 +98,16 @@ type Tolerances struct {
 	Relative *float64 `json:"relative,omitempty" yaml:"relative,omitempty"`
 }
 
+// Validate rejects tolerance values that cannot participate in numeric comparison.
+func (t Tolerances) Validate() error {
+	for _, tolerance := range []*float64{t.Absolute, t.Relative} {
+		if tolerance != nil && (*tolerance < 0 || math.IsNaN(*tolerance) || math.IsInf(*tolerance, 0)) {
+			return errors.New("tolerances must be finite and nonnegative")
+		}
+	}
+	return nil
+}
+
 type Policy struct {
 	SchemaVersion string                 `json:"schema_version" yaml:"schema_version"`
 	Mode          string                 `json:"mode" yaml:"mode"`
@@ -460,10 +470,8 @@ func (o ObservationSpec) Validate() error {
 		return errors.New("comparator symbol is not a valid repository helper reference")
 	}
 	if o.Tolerances != nil {
-		for _, tolerance := range []*float64{o.Tolerances.Absolute, o.Tolerances.Relative} {
-			if tolerance != nil && (*tolerance < 0 || math.IsNaN(*tolerance) || math.IsInf(*tolerance, 0)) {
-				return errors.New("tolerances must be finite and nonnegative")
-			}
+		if err := o.Tolerances.Validate(); err != nil {
+			return err
 		}
 	}
 	return nil

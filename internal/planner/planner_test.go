@@ -190,14 +190,18 @@ func TestManagedCallsUsePostExecutionContexts(t *testing.T) {
 	output := filepath.Join(t.TempDir(), "run")
 	var localEvidencePresent atomic.Bool
 	fmServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(response, `{"explanation":"reviewed","suspicion":"low"}`)
+		if _, err := fmt.Fprint(response, `{"explanation":"reviewed","suspicion":"low"}`); err != nil {
+			t.Errorf("write managed FM response: %v", err)
+		}
 	}))
 	defer fmServer.Close()
 	telemetryServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
 		if _, err := os.Stat(filepath.Join(output, "evidence-pack.json")); err == nil {
 			localEvidencePresent.Store(true)
 		}
-		fmt.Fprint(response, `{"id":"remote-evidence"}`)
+		if _, err := fmt.Fprint(response, `{"id":"remote-evidence"}`); err != nil {
+			t.Errorf("write telemetry response: %v", err)
+		}
 	}))
 	defer telemetryServer.Close()
 	policy := config.DefaultPolicy()

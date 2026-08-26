@@ -32,6 +32,7 @@ func TestContainerArgsEnforceInitialTrustBoundary(t *testing.T) {
 
 func TestContainerDeadlineIsNotReportedAsCommandFailure(t *testing.T) {
 	runtimePath := filepath.Join(t.TempDir(), "slow-runtime")
+	//nolint:gosec // Executable test fixture requires owner execute permission.
 	if err := os.WriteFile(runtimePath, []byte("#!/bin/sh\nexec sleep 5\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +47,7 @@ func TestContainerDeadlineIsNotReportedAsCommandFailure(t *testing.T) {
 }
 
 func TestCompletedNonzeroExitWinsOverConcurrentContextExpiry(t *testing.T) {
-	runErr := exec.Command("/bin/sh", "-c", "exit 7").Run()
+	runErr := exec.CommandContext(t.Context(), "/bin/sh", "-c", "exit 7").Run()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	result, err := classifyRunError(ctx, CommandResult{}, runErr, false, "failed")
@@ -56,7 +57,7 @@ func TestCompletedNonzeroExitWinsOverConcurrentContextExpiry(t *testing.T) {
 }
 
 func TestCompletedNonzeroExitWinsEvenWhenCancelKillRaces(t *testing.T) {
-	runErr := exec.Command("/bin/sh", "-c", "exit 7").Run()
+	runErr := exec.CommandContext(t.Context(), "/bin/sh", "-c", "exit 7").Run()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	result, err := classifyRunError(ctx, CommandResult{}, runErr, true, "")
@@ -66,7 +67,7 @@ func TestCompletedNonzeroExitWinsEvenWhenCancelKillRaces(t *testing.T) {
 }
 
 func TestCancellationThatSignalsProcessWinsOverSignaledExit(t *testing.T) {
-	runErr := exec.Command("/bin/sh", "-c", "kill -KILL $$").Run()
+	runErr := exec.CommandContext(t.Context(), "/bin/sh", "-c", "kill -KILL $$").Run()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	_, err := classifyRunError(ctx, CommandResult{}, runErr, true, "")
