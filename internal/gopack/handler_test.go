@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -279,6 +280,34 @@ func (b blockingImporter) Import(path string) (*types.Package, error) {
 	}
 	<-b.release
 	return nil, fmt.Errorf("import %q was released", path)
+}
+
+type cancelAfterFirstErrContext struct {
+	context.Context
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (c *cancelAfterFirstErrContext) Err() error {
+	err := c.Context.Err()
+	if err == nil {
+		c.once.Do(c.cancel)
+	}
+	return err
+}
+
+func TestTypeCheckHandlesCancellationBetweenPackageChecks(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "sample.go", "package sample\nfunc Example() {}\n", parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseCtx, cancel := context.WithCancel(context.Background())
+	ctx := &cancelAfterFirstErrContext{Context: baseCtx, cancel: cancel}
+	_, _, _, err = typeCheckSynchronously(ctx, fset, map[string]*ast.File{"sample.go": file}, packageMetadata{}, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("type checking returned the wrong cancellation error: %v", err)
+	}
 }
 
 func TestTypeCheckReturnsWhenFallbackImporterIgnoresCancellation(t *testing.T) {

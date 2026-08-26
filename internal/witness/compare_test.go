@@ -2,6 +2,7 @@ package witness
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 
@@ -41,6 +42,21 @@ func TestFloatingTolerance(t *testing.T) {
 	violated, _, err = Compare(domain.ComparatorSpec{BuiltIn: "exact"}, &domain.Tolerances{Absolute: &abs}, 1.0, 1.02)
 	if err != nil || !violated {
 		t.Fatalf("difference outside tolerance must violate: %v", err)
+	}
+}
+
+func TestCompareRejectsInvalidTolerance(t *testing.T) {
+	for name, value := range map[string]float64{
+		"negative": -0.01,
+		"nan":      math.NaN(),
+		"infinite": math.Inf(1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, _, err := Compare(domain.ComparatorSpec{BuiltIn: "exact"}, &domain.Tolerances{Absolute: &value}, 1.0, 1.0)
+			if err == nil || !strings.Contains(err.Error(), "finite and nonnegative") {
+				t.Fatalf("invalid tolerance was not rejected explicitly: %v", err)
+			}
+		})
 	}
 }
 

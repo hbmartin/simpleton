@@ -38,6 +38,11 @@ type ReplayAssessment struct {
 
 // Compare reports whether the approved comparator is violated.
 func Compare(spec domain.ComparatorSpec, tolerances *domain.Tolerances, before, after any) (bool, string, error) {
+	if tolerances != nil {
+		if err := tolerances.Validate(); err != nil {
+			return false, "", err
+		}
+	}
 	if spec.Symbol != "" {
 		return false, "", errors.New("repository comparator symbols must be executed by a language pack")
 	}

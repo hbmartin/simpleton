@@ -389,9 +389,15 @@ func typeCheckSynchronously(ctx context.Context, fset *token.FileSet, parsed map
 			return nil, nil, nil, err
 		}
 		_, _ = checker.check(packagePath, packages[packagePath])
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, err
+		}
 	}
 	receiverTypes := make([]types.Type, 0)
 	for _, packagePath := range packagePaths {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, err
+		}
 		group := packages[packagePath]
 		for _, name := range group.types.Scope().Names() {
 			typeName, ok := group.types.Scope().Lookup(name).(*types.TypeName)
@@ -421,6 +427,7 @@ func typeCheckSynchronously(ctx context.Context, fset *token.FileSet, parsed map
 			}
 		}
 	}
+	implementingTypesByInterface := map[*types.Interface][]types.Type{}
 	for _, packagePath := range packagePaths {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, nil, err
@@ -441,7 +448,7 @@ func typeCheckSynchronously(ctx context.Context, fset *token.FileSet, parsed map
 					if !ok {
 						return true
 					}
-					for _, called := range calledFunctions(group.info, call.Fun, receiverTypes) {
+					for _, called := range calledFunctions(group.info, call.Fun, receiverTypes, implementingTypesByInterface) {
 						calledKey := functionKey(called)
 						if calledKey != "" {
 							callers[calledKey] = append(callers[calledKey], caller{Path: path, Symbol: declarationSymbol(fn)})
@@ -471,7 +478,7 @@ func typeCheckSynchronously(ctx context.Context, fset *token.FileSet, parsed map
 	return declarationKeys, callers, diagnostics, nil
 }
 
-func calledFunctions(info *types.Info, expression ast.Expr, receiverTypes []types.Type) []*types.Func {
+func calledFunctions(info *types.Info, expression ast.Expr, receiverTypes []types.Type, implementingTypesByInterface map[*types.Interface][]types.Type) []*types.Func {
 	called := calledFunction(info, expression)
 	functions := []*types.Func{}
 	seen := map[string]bool{}
@@ -491,11 +498,17 @@ func calledFunctions(info *types.Info, expression ast.Expr, receiverTypes []type
 	if !ok {
 		return functions
 	}
-	interfaceType.Complete()
-	for _, receiverType := range receiverTypes {
-		if !types.Implements(receiverType, interfaceType) {
-			continue
+	implementingTypes, cached := implementingTypesByInterface[interfaceType]
+	if !cached {
+		interfaceType.Complete()
+		for _, receiverType := range receiverTypes {
+			if types.Implements(receiverType, interfaceType) {
+				implementingTypes = append(implementingTypes, receiverType)
+			}
 		}
+		implementingTypesByInterface[interfaceType] = implementingTypes
+	}
+	for _, receiverType := range implementingTypes {
 		candidate, _, _ := types.LookupFieldOrMethod(receiverType, true, called.Pkg(), called.Name())
 		function, _ := candidate.(*types.Func)
 		appendFunction(function)

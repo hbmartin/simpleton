@@ -56,6 +56,21 @@ func TestPolicyRejectsUnsafeBlockingAndBudget(t *testing.T) {
 	}
 }
 
+func TestPolicyRejectsNonPositiveMethodBudget(t *testing.T) {
+	for name, budget := range map[string]Duration{
+		"zero":     0,
+		"negative": Duration(-time.Second),
+	} {
+		t.Run(name, func(t *testing.T) {
+			policy := testPolicy()
+			policy.Budgets.Methods = map[string]Duration{"managed_fm": budget}
+			if err := policy.Validate(); err == nil {
+				t.Fatal("non-positive method budget was accepted")
+			}
+		})
+	}
+}
+
 func TestBlockingPolicyAllowsExplicitlyEmptyCategorySet(t *testing.T) {
 	policy := testPolicy()
 	policy.Mode = "blocking"
