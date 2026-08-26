@@ -203,19 +203,19 @@ func (p Planner) Analyze(ctx context.Context, request Request) (Result, error) {
 	defer cancel()
 	baselineRepository := repo.Path
 	candidateRepository := repo.Path
-	cleanupBaseline := func() error { return nil }
-	cleanupCandidate := func() error { return nil }
 	if len(policy.Commands) > 0 {
+		var cleanupBaseline func() error
 		baselineRepository, cleanupBaseline, err = repo.DetachedWorktree(runCtx, base)
 		if err != nil {
 			return Result{}, fmt.Errorf("prepare detached baseline worktree: %w", err)
 		}
-		defer cleanupBaseline()
+		defer func() { _ = cleanupBaseline() }()
+		var cleanupCandidate func() error
 		candidateRepository, cleanupCandidate, err = repo.DetachedWorktree(runCtx, head)
 		if err != nil {
 			return Result{}, fmt.Errorf("prepare detached candidate worktree: %w", err)
 		}
-		defer cleanupCandidate()
+		defer func() { _ = cleanupCandidate() }()
 	}
 	commandMethods := p.runCommands(runCtx, baselineRepository, candidateRepository, policy)
 	pack.Methods = append(pack.Methods, commandMethods...)
@@ -266,7 +266,7 @@ func (p Planner) Analyze(ctx context.Context, request Request) (Result, error) {
 		return Result{}, err
 	}
 	saveCtx, saveCancel := context.WithTimeout(requestCtx, 30*time.Second)
-	digest, err := state.SaveEvidence(saveCtx, pack)
+	_, err = state.SaveEvidence(saveCtx, pack)
 	saveCancel()
 	if err != nil {
 		return Result{}, err
@@ -282,7 +282,7 @@ func (p Planner) Analyze(ctx context.Context, request Request) (Result, error) {
 		return Result{}, err
 	}
 	saveCtx, saveCancel = context.WithTimeout(requestCtx, 30*time.Second)
-	digest, err = state.SaveEvidence(saveCtx, pack)
+	digest, err := state.SaveEvidence(saveCtx, pack)
 	saveCancel()
 	if err != nil {
 		return Result{}, err
@@ -752,16 +752,17 @@ func (p Planner) runCommands(ctx context.Context, baselineRepo, candidateRepo st
 		if configured, ok := policy.Budgets.Methods[spec.ID]; ok {
 			budget = configured.Duration()
 		}
-		methodCtx, cancel := context.WithTimeout(ctx, budget)
 		started := time.Now()
 		image := spec.Image
 		if image == "" {
 			image = policy.Execution.Image
 		}
-		baseline, baselineErr := p.Runner.Run(methodCtx, baselineRepo, policy.Execution, image, spec.Command)
+		baselineCtx, baselineCancel := context.WithTimeout(ctx, budget)
+		baseline, baselineErr := p.Runner.Run(baselineCtx, baselineRepo, policy.Execution, image, spec.Command)
+		baselineCancel()
 		method := domain.MethodResult{ID: spec.ID, Language: spec.Language, Budget: budget.String(), Findings: []domain.Finding{}}
 		switch {
-		case errors.Is(methodCtx.Err(), context.DeadlineExceeded) || errors.Is(baselineErr, context.DeadlineExceeded):
+		case errors.Is(baselineCtx.Err(), context.DeadlineExceeded) || errors.Is(baselineErr, context.DeadlineExceeded):
 			method.Status = domain.StatusBudgetExhausted
 			method.Reason = "baseline command exceeded its policy budget"
 		case baselineErr != nil:
@@ -777,9 +778,11 @@ func (p Planner) runCommands(ctx context.Context, baselineRepo, candidateRepo st
 			method.Status = domain.StatusInconclusive
 			method.Reason = fmt.Sprintf("baseline command failed with exit code %d; a regression cannot be established", baseline.ExitCode)
 		default:
-			candidate, candidateErr := p.Runner.Run(methodCtx, candidateRepo, policy.Execution, image, spec.Command)
+			candidateCtx, candidateCancel := context.WithTimeout(ctx, budget)
+			candidate, candidateErr := p.Runner.Run(candidateCtx, candidateRepo, policy.Execution, image, spec.Command)
+			candidateCancel()
 			switch {
-			case errors.Is(methodCtx.Err(), context.DeadlineExceeded) || errors.Is(candidateErr, context.DeadlineExceeded):
+			case errors.Is(candidateCtx.Err(), context.DeadlineExceeded) || errors.Is(candidateErr, context.DeadlineExceeded):
 				method.Status = domain.StatusBudgetExhausted
 				method.Reason = "candidate command exceeded its policy budget"
 			case candidateErr != nil:
@@ -802,7 +805,6 @@ func (p Planner) runCommands(ctx context.Context, baselineRepo, candidateRepo st
 				method.Status = domain.StatusRan
 			}
 		}
-		cancel()
 		method.DurationMS = time.Since(started).Milliseconds()
 		results = append(results, method)
 	}

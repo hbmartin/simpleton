@@ -153,9 +153,9 @@ func parseRepository(ctx context.Context, repo gitx.Repository, revision string,
 		}
 		goPaths = append(goPaths, path)
 	}
-	sources, err := repo.FilesAt(ctx, revision, goPaths)
-	if err != nil {
-		return nil, nil, nil, nil, err
+	sources, _ := repo.FilesAt(ctx, revision, goPaths)
+	if sources == nil {
+		sources = map[string][]byte{}
 	}
 	for _, path := range goPaths {
 		if ctx.Err() != nil {
@@ -163,7 +163,11 @@ func parseRepository(ctx context.Context, repo gitx.Repository, revision string,
 		}
 		source, ok := sources[path]
 		if !ok {
-			continue
+			var err error
+			source, err = repo.FileAt(ctx, revision, path)
+			if err != nil {
+				continue
+			}
 		}
 		file, err := parser.ParseFile(fset, path, source, parser.SkipObjectResolution)
 		if err != nil {
@@ -200,16 +204,19 @@ func loadPackageMetadata(ctx context.Context, repo gitx.Repository, revision str
 			modulePaths = append(modulePaths, path)
 		}
 	}
-	contentsByPath, err := repo.FilesAt(ctx, revision, modulePaths)
-	if err != nil {
-		metadata.diagnostics = append(metadata.diagnostics, "read module metadata: "+err.Error())
-		return metadata
+	contentsByPath, _ := repo.FilesAt(ctx, revision, modulePaths)
+	if contentsByPath == nil {
+		contentsByPath = map[string][]byte{}
 	}
 	for _, path := range modulePaths {
 		contents, ok := contentsByPath[path]
 		if !ok {
-			metadata.diagnostics = append(metadata.diagnostics, "read "+path+": blob is missing")
-			continue
+			var err error
+			contents, err = repo.FileAt(ctx, revision, path)
+			if err != nil {
+				metadata.diagnostics = append(metadata.diagnostics, "read "+path+": "+err.Error())
+				continue
+			}
 		}
 		modulePath, err := parseModulePath(contents)
 		if err != nil {
@@ -295,6 +302,13 @@ type importResult struct {
 	err  error
 }
 
+type typeCheckResult struct {
+	declarationKeys map[*ast.FuncDecl]string
+	callers         map[string][]caller
+	diagnostics     []string
+	err             error
+}
+
 func (r *repositoryImporter) Import(path string) (*types.Package, error) {
 	if path == "unsafe" {
 		return types.Unsafe, nil
@@ -355,7 +369,20 @@ func typeCheck(ctx context.Context, fset *token.FileSet, parsed map[string]*ast.
 }
 
 func typeCheckWithImporter(ctx context.Context, fset *token.FileSet, parsed map[string]*ast.File, metadata packageMetadata, changed map[string]bool, fallback types.Importer) (map[*ast.FuncDecl]string, map[string][]caller, []string, error) {
-	return typeCheckSynchronously(ctx, fset, parsed, metadata, changed, fallback)
+	completed := make(chan typeCheckResult, 1)
+	go func() {
+		declarationKeys, callers, diagnostics, err := typeCheckSynchronously(ctx, fset, parsed, metadata, changed, fallback)
+		completed <- typeCheckResult{declarationKeys: declarationKeys, callers: callers, diagnostics: diagnostics, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, nil, nil, ctx.Err()
+	case result := <-completed:
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, err
+		}
+		return result.declarationKeys, result.callers, result.diagnostics, result.err
+	}
 }
 
 func typeCheckSynchronously(ctx context.Context, fset *token.FileSet, parsed map[string]*ast.File, metadata packageMetadata, changed map[string]bool, fallback types.Importer) (map[*ast.FuncDecl]string, map[string][]caller, []string, error) {
@@ -502,9 +529,26 @@ func relevantPackagePaths(packagePaths []string, packages map[string]*parsedPack
 	if len(changed) == 0 {
 		return slices.Clone(packagePaths)
 	}
+	// Interface-dispatched callers need a repository-wide view: a consumer can
+	// depend only on the interface package and never import its implementation.
+	// Restrict free-function analysis to the import closure, but retain every
+	// package whenever a changed target is a method.
+	for _, group := range packages {
+		for index, file := range group.files {
+			if !changed[group.paths[index]] {
+				continue
+			}
+			for _, declaration := range file.Decls {
+				if function, ok := declaration.(*ast.FuncDecl); ok && function.Recv != nil {
+					return slices.Clone(packagePaths)
+				}
+			}
+		}
+	}
 	selected := map[string]bool{}
-	imports := make(map[string][]string, len(packages))
-	for packagePath, group := range packages {
+	importers := make(map[string][]string, len(packages))
+	for _, packagePath := range packagePaths {
+		group := packages[packagePath]
 		for index, file := range group.files {
 			if changed[group.paths[index]] {
 				selected[packagePath] = true
@@ -512,23 +556,24 @@ func relevantPackagePaths(packagePaths []string, packages map[string]*parsedPack
 			for _, spec := range file.Imports {
 				importPath, err := strconv.Unquote(spec.Path.Value)
 				if err == nil && packages[importPath] != nil {
-					imports[packagePath] = append(imports[packagePath], importPath)
+					importers[importPath] = append(importers[importPath], packagePath)
 				}
 			}
 		}
 	}
-	for expanded := true; expanded; {
-		expanded = false
-		for packagePath, dependencies := range imports {
-			if selected[packagePath] {
-				continue
-			}
-			for _, dependency := range dependencies {
-				if selected[dependency] {
-					selected[packagePath] = true
-					expanded = true
-					break
-				}
+	worklist := make([]string, 0, len(selected))
+	for _, packagePath := range packagePaths {
+		if selected[packagePath] {
+			worklist = append(worklist, packagePath)
+		}
+	}
+	for len(worklist) > 0 {
+		dependency := worklist[len(worklist)-1]
+		worklist = worklist[:len(worklist)-1]
+		for _, packagePath := range importers[dependency] {
+			if !selected[packagePath] {
+				selected[packagePath] = true
+				worklist = append(worklist, packagePath)
 			}
 		}
 	}

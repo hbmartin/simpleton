@@ -14,6 +14,8 @@ import (
 	"github.com/haroldmartin/simpleton/internal/numeric"
 )
 
+const maxToleranceUnorderedItems = 256
+
 // ObservationPair is one baseline/candidate execution of an Observation Spec.
 // LegalInput and DomainEvidence are supplied by reviewed preconditions and
 // repository helpers; this package never guesses whether an input is legal.
@@ -360,6 +362,9 @@ func unorderedEqual(left, right []any, tolerances *domain.Tolerances) (bool, err
 			return false, err
 		}
 		return reflect.DeepEqual(leftCanonical, rightCanonical), nil
+	}
+	if len(left) > maxToleranceUnorderedItems {
+		return false, nil
 	}
 	matches := make([]int, len(right))
 	for index := range matches {

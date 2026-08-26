@@ -54,6 +54,15 @@ func TestUnorderedCollectionAppliesFloatingTolerance(t *testing.T) {
 	}
 }
 
+func TestUnorderedCollectionBoundsToleranceMatching(t *testing.T) {
+	abs := 0.01
+	items := make([]any, maxToleranceUnorderedItems+1)
+	violated, _, err := Compare(domain.ComparatorSpec{BuiltIn: "unordered_collection"}, &domain.Tolerances{Absolute: &abs}, items, items)
+	if err != nil || !violated {
+		t.Fatalf("oversized tolerance matching must fail closed: violated=%t err=%v", violated, err)
+	}
+}
+
 func TestExceptionComparatorRejectsTolerance(t *testing.T) {
 	abs := 0.01
 	_, _, err := Compare(domain.ComparatorSpec{BuiltIn: "exception"}, &domain.Tolerances{Absolute: &abs},

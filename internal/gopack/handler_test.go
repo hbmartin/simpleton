@@ -139,6 +139,43 @@ func TestAnalyzeResolvesInterfaceDispatchToConcreteMethod(t *testing.T) {
 	t.Fatalf("Task.Run target was not found: %#v", result.Targets)
 }
 
+func TestAnalyzeResolvesInterfaceCallerWithoutImplementationImport(t *testing.T) {
+	repo := t.TempDir()
+	git(t, repo, "init", "-q")
+	git(t, repo, "config", "user.email", "simpleton@example.invalid")
+	git(t, repo, "config", "user.name", "Simpleton Test")
+	write(t, filepath.Join(repo, "go.mod"), "module example.invalid/disconnected\n\ngo 1.24\n")
+	write(t, filepath.Join(repo, "api", "runner.go"), "package api\n\ntype Runner interface { Run() }\n")
+	write(t, filepath.Join(repo, "impl", "task.go"), "package impl\n\nimport \"example.invalid/disconnected/api\"\n\ntype Task struct{}\nvar _ api.Runner = Task{}\nfunc (Task) Run() {}\n")
+	write(t, filepath.Join(repo, "consumer", "use.go"), "package consumer\n\nimport \"example.invalid/disconnected/api\"\n\nfunc Use(value api.Runner) { value.Run() }\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-qm", "base")
+	base := git(t, repo, "rev-parse", "HEAD")
+	write(t, filepath.Join(repo, "impl", "task.go"), "package impl\n\nimport \"example.invalid/disconnected/api\"\n\ntype Task struct{}\nvar _ api.Runner = Task{}\nfunc (Task) Run() { _ = 1 }\n")
+	git(t, repo, "commit", "-qam", "candidate")
+	head := git(t, repo, "rev-parse", "HEAD")
+
+	result, err := (Handler{}).Analyze(context.Background(), packrpc.AnalyzeParams{
+		Repository: repo, BaseRevision: base, HeadRevision: head,
+		ChangedFiles: []gitx.ChangedFile{{Path: "impl/task.go", Language: "go"}}, BudgetMS: 10_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range result.Targets {
+		if target.Symbol != "Task.Run" {
+			continue
+		}
+		for _, boundary := range target.ObservationCandidates {
+			if boundary.Kind == "unchanged_caller" && boundary.Path == "consumer/use.go" && boundary.Symbol == "Use" {
+				return
+			}
+		}
+		t.Fatalf("interface-only consumer was not resolved: %#v", target.ObservationCandidates)
+	}
+	t.Fatalf("Task.Run target was not found: %#v", result.Targets)
+}
+
 func TestAnalyzeResolvesInterfaceDispatchToPromotedMethod(t *testing.T) {
 	repo := t.TempDir()
 	git(t, repo, "init", "-q")
@@ -290,12 +327,34 @@ func TestModuleMetadataDerivesPackagePathsWithoutCompilingRepository(t *testing.
 	}
 	t.Setenv("SIMPLETON_GO_MARKER", marker)
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	metadata := loadPackageMetadata(context.Background(), repository, revision, []string{"go.mod", "main.go"})
+	metadata := loadPackageMetadata(context.Background(), repository, revision, []string{"missing\n/go.mod", "go.mod", "main.go"})
 	if got := metadata.packagePath(".", "fallback"); got != "example.invalid/metadata" {
 		t.Fatalf("module package path is missing: got=%q diagnostics=%#v", got, metadata.diagnostics)
 	}
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("metadata discovery executed the candidate Go toolchain: %v", err)
+	}
+}
+
+func TestParseRepositoryFallsBackPerPathAfterBatchFailure(t *testing.T) {
+	repo := t.TempDir()
+	git(t, repo, "init", "-q")
+	git(t, repo, "config", "user.email", "simpleton@example.invalid")
+	git(t, repo, "config", "user.name", "Simpleton Test")
+	write(t, filepath.Join(repo, "main.go"), "package sample\n\nfunc Example() {}\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-qm", "sample")
+	revision := git(t, repo, "rev-parse", "HEAD")
+	repository, err := gitx.Open(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, _, _, _, err := parseRepository(context.Background(), repository, revision, []string{"missing\n.go", "main.go"}, map[string]bool{"main.go": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed["main.go"] == nil {
+		t.Fatalf("valid blob was discarded after batch failure: %#v", parsed)
 	}
 }
 
@@ -335,7 +394,7 @@ func TestTypeCheckHandlesCancellationBetweenPackageChecks(t *testing.T) {
 	}
 	baseCtx, cancel := context.WithCancel(context.Background())
 	ctx := &cancelAfterFirstErrContext{Context: baseCtx, cancel: cancel}
-	_, _, _, err = typeCheckSynchronously(ctx, fset, map[string]*ast.File{"sample.go": file}, packageMetadata{}, map[string]bool{"sample.go": true}, nil)
+	_, _, _, err = typeCheckWithImporter(ctx, fset, map[string]*ast.File{"sample.go": file}, packageMetadata{}, map[string]bool{"sample.go": true}, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("type checking returned the wrong cancellation error: %v", err)
 	}

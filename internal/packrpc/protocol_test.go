@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,6 +17,23 @@ import (
 
 type testHandler struct {
 	cancelled atomic.Bool
+}
+
+type closeTrackingReader struct {
+	io.Reader
+	closed  atomic.Bool
+	started chan struct{}
+	once    sync.Once
+}
+
+func (r *closeTrackingReader) Read(buffer []byte) (int, error) {
+	r.once.Do(func() { close(r.started) })
+	return r.Reader.Read(buffer)
+}
+
+func (r *closeTrackingReader) Close() error {
+	r.closed.Store(true)
+	return nil
 }
 
 func (*testHandler) Capability() domain.PackCapability {
@@ -72,15 +90,28 @@ func TestCancelCancelsInflightRequest(t *testing.T) {
 	}
 }
 
-func TestServeReturnsWhenContextIsCancelledWhileInputIsIdle(t *testing.T) {
+func TestServeCancellationWaitsForDecoderWithoutClosingInput(t *testing.T) {
 	reader, writer := io.Pipe()
-	defer writer.Close()
+	defer func() { _ = writer.Close() }()
+	tracked := &closeTrackingReader{Reader: reader, started: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
 	returned := make(chan error, 1)
 	go func() {
-		returned <- Serve(ctx, reader, io.Discard, &testHandler{})
+		returned <- Serve(ctx, tracked, io.Discard, &testHandler{})
 	}()
+	<-tracked.started
 	cancel()
+	select {
+	case err := <-returned:
+		t.Fatalf("Serve returned before the decoder stopped: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	if tracked.closed.Load() {
+		t.Fatal("Serve closed its caller-provided reader")
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case err := <-returned:
 		if !errors.Is(err, context.Canceled) {

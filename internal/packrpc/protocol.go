@@ -237,12 +237,19 @@ type decodedRequest struct {
 }
 
 func Serve(ctx context.Context, in io.Reader, out io.Writer, handler Handler) error {
-	dec := json.NewDecoder(bufio.NewReader(in))
 	enc := json.NewEncoder(out)
 	decoded := make(chan decodedRequest)
-	go func() {
-		defer close(decoded)
+	decoderDone := make(chan struct{})
+	go func(reader io.Reader) {
+		defer func() {
+			close(decoded)
+			close(decoderDone)
+		}()
+		dec := json.NewDecoder(bufio.NewReader(reader))
 		for {
+			if ctx.Err() != nil {
+				return
+			}
 			var request RawRequest
 			err := dec.Decode(&request)
 			select {
@@ -254,7 +261,7 @@ func Serve(ctx context.Context, in io.Reader, out io.Writer, handler Handler) er
 				return
 			}
 		}
-	}()
+	}(in)
 	var writeMu sync.Mutex
 	var inflightMu sync.Mutex
 	inflight := map[int64]context.CancelFunc{}
@@ -276,15 +283,22 @@ func Serve(ctx context.Context, in io.Reader, out io.Writer, handler Handler) er
 		var request RawRequest
 		select {
 		case <-ctx.Done():
-			if closer, ok := in.(io.Closer); ok {
-				_ = closer.Close()
-			}
+			<-decoderDone
 			return ctx.Err()
 		case item, ok := <-decoded:
 			if !ok {
+				<-decoderDone
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 				return nil
 			}
+			if err := ctx.Err(); err != nil {
+				<-decoderDone
+				return err
+			}
 			if item.err != nil {
+				<-decoderDone
 				if errors.Is(item.err, io.EOF) {
 					return nil
 				}

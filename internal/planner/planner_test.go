@@ -61,6 +61,19 @@ func (f fakeRunner) Run(context.Context, string, domain.ExecutionPolicy, string,
 	return f.result, f.err
 }
 
+type independentContextRunner struct {
+	contexts                      []context.Context
+	baselineCancelledBeforeSecond bool
+}
+
+func (r *independentContextRunner) Run(ctx context.Context, _ string, _ domain.ExecutionPolicy, _ string, _ []string) (execution.CommandResult, error) {
+	if len(r.contexts) == 1 {
+		r.baselineCancelledBeforeSecond = r.contexts[0].Err() != nil
+	}
+	r.contexts = append(r.contexts, ctx)
+	return execution.CommandResult{}, nil
+}
+
 func TestAnalyzeProposesIntentAndCanStillBlockBuildRegression(t *testing.T) {
 	repository, base, head := testRepository(t, "before\n", "after\n")
 	policy := config.DefaultPolicy()
@@ -128,6 +141,21 @@ func TestPolicyCommandInfrastructureExitCannotBecomeFinding(t *testing.T) {
 	methods := (Planner{Runner: runner}).runCommands(context.Background(), "/baseline", "/candidate", policy)
 	if len(methods) != 1 || methods[0].Status != domain.StatusExecutionFailed || len(methods[0].Findings) != 0 {
 		t.Fatalf("infrastructure exit was promoted as a regression: %#v", methods)
+	}
+}
+
+func TestPolicyCommandExecutionsUseIndependentTimeouts(t *testing.T) {
+	policy := config.DefaultPolicy()
+	policy.Commands = []domain.CommandSpec{{
+		ID: "tests", Category: domain.CategoryTestRegression, Command: []string{"test"}, Image: "image@sha256:abc",
+	}}
+	runner := &independentContextRunner{}
+	methods := (Planner{Runner: runner}).runCommands(context.Background(), "/baseline", "/candidate", policy)
+	if len(methods) != 1 || methods[0].Status != domain.StatusRan {
+		t.Fatalf("unexpected command result: %#v", methods)
+	}
+	if len(runner.contexts) != 2 || runner.contexts[0] == runner.contexts[1] || !runner.baselineCancelledBeforeSecond {
+		t.Fatalf("baseline and candidate did not receive independent timeout windows: %#v", runner)
 	}
 }
 

@@ -37,7 +37,7 @@ async function repository(t, files) {
 
 test("uses qualified 64-bit target identities", async (t) => {
   const { repo, revision } = await repository(t, {
-    "sample.ts": "class First { same() { return 1; } }\nclass Second { same() { return 2; } }\n",
+    "sample.ts": "class NamedFirst { same() { return 1; } }\nclass NamedSecond { same() { return 2; } }\nconst First = class { same() { return 3; } };\nconst Second = class { same() { return 4; } };\n",
   });
   const responses = await runPack([
     { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocol_version: "1" } },
@@ -46,8 +46,8 @@ test("uses qualified 64-bit target identities", async (t) => {
     } },
   ]);
   const targets = responses[1].result.targets;
-  assert.deepEqual(new Set(targets.map((target) => target.symbol)), new Set(["First.same", "Second.same"]));
-  assert.equal(new Set(targets.map((target) => target.id)).size, 2);
+  assert.deepEqual(new Set(targets.map((target) => target.symbol)), new Set(["NamedFirst.same", "NamedSecond.same", "First.same", "Second.same"]));
+  assert.equal(new Set(targets.map((target) => target.id)).size, 4);
   assert.ok(targets.every((target) => target.id.length === 16));
 });
 

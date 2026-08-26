@@ -149,7 +149,10 @@ function collectCallers(program, repo, changed) {
     const visit = (node, scope = [], enclosing = "<module>") => {
       let childScope = scope;
       let childEnclosing = enclosing;
-      if (isClassLike(node) && node.name && ts.isIdentifier(node.name)) childScope = [...scope, node.name.text];
+      if (isClassLike(node)) {
+        const name = className(node);
+        if (name) childScope = [...scope, name];
+      }
       if (isFunctionLike(node)) {
         const name = functionName(node);
         if (name) {
@@ -175,7 +178,10 @@ function collectCallers(program, repo, changed) {
 function visitFunctions(source, callback) {
   const visit = (node, scope = []) => {
     let childScope = scope;
-    if (isClassLike(node) && node.name && ts.isIdentifier(node.name)) childScope = [...scope, node.name.text];
+    if (isClassLike(node)) {
+      const name = className(node);
+      if (name) childScope = [...scope, name];
+    }
     if (isFunctionLike(node)) {
       const calledName = functionName(node);
       if (calledName) {
@@ -195,6 +201,12 @@ function isFunctionLike(node) {
 
 function isClassLike(node) {
   return ts.isClassDeclaration(node) || ts.isClassExpression(node);
+}
+
+function className(node) {
+  if (node.name && ts.isIdentifier(node.name)) return node.name.text;
+  if (node.parent && ts.isVariableDeclaration(node.parent) && ts.isIdentifier(node.parent.name)) return node.parent.name.text;
+  return "";
 }
 
 function functionName(node) {

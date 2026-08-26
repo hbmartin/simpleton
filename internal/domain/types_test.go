@@ -30,6 +30,7 @@ func TestObservationRejectsToleranceForExceptionComparator(t *testing.T) {
 	absolute := 0.1
 	observation := ObservationSpec{
 		ID: "exception", Target: TargetRef{Language: "go", ScopeType: "api", Symbol: "Run"},
+		Inputs:        []any{},
 		Preconditions: []HookRef{{BuiltIn: "always"}}, CallsOrEvents: []string{"Run"}, Observables: []string{"exception"},
 		Comparator: ComparatorSpec{BuiltIn: "exception"}, Tolerances: &Tolerances{Absolute: &absolute},
 	}
