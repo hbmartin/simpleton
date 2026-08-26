@@ -1,9 +1,12 @@
+import ast
 import json
 import pathlib
 import subprocess
 import sys
 import tempfile
 import unittest
+
+from packs.python.simpleton_pack import collect_callers
 
 
 class ProtocolTest(unittest.TestCase):
@@ -39,7 +42,11 @@ class ProtocolTest(unittest.TestCase):
                 "class Second:\n    def same(self):\n        return 2\n",
                 encoding="utf-8",
             )
-            subprocess.run(["git", "-C", str(repo), "add", "sample.py"], check=True)
+            (repo / "caller.py").write_text(
+                "def invoke(value):\n    return value.same()\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(repo), "add", "sample.py", "caller.py"], check=True)
             subprocess.run(["git", "-C", str(repo), "commit", "-qm", "sample"], check=True)
             revision = subprocess.check_output(
                 ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
@@ -70,6 +77,24 @@ class ProtocolTest(unittest.TestCase):
             self.assertEqual({target["symbol"] for target in targets}, {"First.same", "Second.same"})
             self.assertEqual(len({target["id"] for target in targets}), 2)
             self.assertTrue(all(len(target["id"]) == 16 for target in targets))
+            self.assertTrue(
+                all(
+                    boundary["kind"] != "unchanged_caller"
+                    for target in targets
+                    for boundary in target["observation_candidates"]
+                )
+            )
+
+    def test_unique_method_keeps_qualified_caller_boundary(self) -> None:
+        callers = collect_callers(
+            {
+                "target.py": ast.parse("class Only:\n    def same(self):\n        return 1\n"),
+                "caller.py": ast.parse("class Public:\n    def invoke(self, value):\n        return value.same()\n"),
+            },
+            {"target.py"},
+            {"same": "Only.same"},
+        )
+        self.assertEqual(callers["Only.same"], [{"path": "caller.py", "symbol": "Public.invoke"}])
 
 
 if __name__ == "__main__":

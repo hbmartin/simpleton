@@ -33,8 +33,15 @@ func (r *closeTrackingReader) Read(buffer []byte) (int, error) {
 
 func (r *closeTrackingReader) Close() error {
 	r.closed.Store(true)
+	if closer, ok := r.Reader.(io.Closer); ok {
+		return closer.Close()
+	}
 	return nil
 }
+
+type failingWriter struct{ err error }
+
+func (w failingWriter) Write([]byte) (int, error) { return 0, w.err }
 
 func (*testHandler) Capability() domain.PackCapability {
 	return domain.PackCapability{Language: "test", ProtocolVersion: domain.ProtocolVersion}
@@ -90,7 +97,7 @@ func TestCancelCancelsInflightRequest(t *testing.T) {
 	}
 }
 
-func TestServeCancellationWaitsForDecoderWithoutClosingInput(t *testing.T) {
+func TestServeReturnsWhenContextIsCancelledWhileInputIsIdle(t *testing.T) {
 	reader, writer := io.Pipe()
 	defer func() { _ = writer.Close() }()
 	tracked := &closeTrackingReader{Reader: reader, started: make(chan struct{})}
@@ -103,22 +110,39 @@ func TestServeCancellationWaitsForDecoderWithoutClosingInput(t *testing.T) {
 	cancel()
 	select {
 	case err := <-returned:
-		t.Fatalf("Serve returned before the decoder stopped: %v", err)
-	case <-time.After(25 * time.Millisecond):
-	}
-	if tracked.closed.Load() {
-		t.Fatal("Serve closed its caller-provided reader")
-	}
-	if err := writer.Close(); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case err := <-returned:
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("Serve returned the wrong cancellation error: %v", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Serve remained blocked decoding idle input after cancellation")
+	}
+	if !tracked.closed.Load() {
+		t.Fatal("Serve did not release the idle decoder input")
+	}
+}
+
+func TestServeReleasesDecoderAfterWriteFailure(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer func() { _ = writer.Close() }()
+	tracked := &closeTrackingReader{Reader: reader, started: make(chan struct{})}
+	writeErr := errors.New("output unavailable")
+	returned := make(chan error, 1)
+	go func() {
+		returned <- Serve(context.Background(), tracked, failingWriter{err: writeErr}, &testHandler{})
+	}()
+	if _, err := io.WriteString(writer, "{\"jsonrpc\":\"invalid\",\"id\":1}\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-returned:
+		if !errors.Is(err, writeErr) {
+			t.Fatalf("Serve returned the wrong write error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not return after its output failed")
+	}
+	if !tracked.closed.Load() {
+		t.Fatal("Serve leaked the decoder input after returning")
 	}
 }
 

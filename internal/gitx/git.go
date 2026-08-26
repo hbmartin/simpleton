@@ -167,6 +167,9 @@ func (r Repository) FilesAt(ctx context.Context, revision string, paths []string
 	for _, path := range batchPaths {
 		header, err := reader.ReadString('\n')
 		if err != nil {
+			if ctx.Err() != nil {
+				return abort(ctx.Err())
+			}
 			return abort(fmt.Errorf("read git cat-file header for %q: %w", path, err))
 		}
 		fields := strings.Fields(strings.TrimSuffix(header, "\n"))

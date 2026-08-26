@@ -3,11 +3,24 @@ package store
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/haroldmartin/simpleton/internal/domain"
 )
+
+func TestOpenAcceptsRelativeRoot(t *testing.T) {
+	t.Chdir(t.TempDir())
+	state, err := Open(filepath.Join("relative", "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	if _, err := os.Stat(filepath.Join("relative", "state", "simpleton.db")); err != nil {
+		t.Fatalf("relative database path was not created: %v", err)
+	}
+}
 
 func TestContentAddressedEvidenceAndOutcome(t *testing.T) {
 	state, err := Open(t.TempDir())
