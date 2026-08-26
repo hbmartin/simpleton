@@ -229,6 +229,39 @@ def qualified_functions(
     return functions
 
 
+class CallVisitor(ast.NodeVisitor):
+    def __init__(
+        self,
+        function: ast.FunctionDef | ast.AsyncFunctionDef,
+        file: str,
+        caller_symbol: str,
+        unambiguous_targets: dict[str, str],
+        callers: defaultdict[str, list[dict[str, str]]],
+    ) -> None:
+        self.function = function
+        self.file = file
+        self.caller_symbol = caller_symbol
+        self.unambiguous_targets = unambiguous_targets
+        self.callers = callers
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        if node is self.function:
+            self.generic_visit(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        if node is self.function:
+            self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        name = called_name(node.func)
+        target = self.unambiguous_targets.get(name)
+        if target:
+            self.callers[target].append(
+                {"path": self.file, "symbol": self.caller_symbol}
+            )
+        self.generic_visit(node)
+
+
 def collect_callers(
     trees: dict[str, ast.Module],
     changed: set[str],
@@ -239,23 +272,9 @@ def collect_callers(
         if file in changed:
             continue
         for function, caller_symbol in qualified_functions(tree):
-            class CallVisitor(ast.NodeVisitor):
-                def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-                    if node is function:
-                        self.generic_visit(node)
-
-                def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-                    if node is function:
-                        self.generic_visit(node)
-
-                def visit_Call(self, node: ast.Call) -> None:
-                    name = called_name(node.func)
-                    target = unambiguous_targets.get(name)
-                    if target:
-                        callers[target].append({"path": file, "symbol": caller_symbol})
-                    self.generic_visit(node)
-
-            CallVisitor().visit(function)
+            CallVisitor(
+                function, file, caller_symbol, unambiguous_targets, callers
+            ).visit(function)
     return callers
 
 

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -63,15 +64,11 @@ func (f fakeRunner) Run(context.Context, string, domain.ExecutionPolicy, string,
 	return f.result, f.err
 }
 
-type independentContextRunner struct {
-	contexts                      []context.Context
-	baselineCancelledBeforeSecond bool
+type sharedContextRunner struct {
+	contexts []context.Context
 }
 
-func (r *independentContextRunner) Run(ctx context.Context, _ string, _ domain.ExecutionPolicy, _ string, _ []string) (execution.CommandResult, error) {
-	if len(r.contexts) == 1 {
-		r.baselineCancelledBeforeSecond = r.contexts[0].Err() != nil
-	}
+func (r *sharedContextRunner) Run(ctx context.Context, _ string, _ domain.ExecutionPolicy, _ string, _ []string) (execution.CommandResult, error) {
 	r.contexts = append(r.contexts, ctx)
 	return execution.CommandResult{}, nil
 }
@@ -146,35 +143,32 @@ func TestPolicyCommandInfrastructureExitCannotBecomeFinding(t *testing.T) {
 	}
 }
 
-func TestPolicyCommandExecutionsUseIndependentTimeouts(t *testing.T) {
+func TestPolicyCommandExecutionsShareMethodTimeout(t *testing.T) {
 	policy := config.DefaultPolicy()
 	policy.Commands = []domain.CommandSpec{{
 		ID: "tests", Category: domain.CategoryTestRegression, Command: []string{"test"}, Image: "image@sha256:abc",
 	}}
-	runner := &independentContextRunner{}
+	runner := &sharedContextRunner{}
 	methods := (Planner{Runner: runner}).runCommands(context.Background(), "/baseline", "/candidate", policy)
 	if len(methods) != 1 || methods[0].Status != domain.StatusRan {
 		t.Fatalf("unexpected command result: %#v", methods)
 	}
-	if len(runner.contexts) != 2 || runner.contexts[0] == runner.contexts[1] || !runner.baselineCancelledBeforeSecond {
-		t.Fatalf("baseline and candidate did not receive independent timeout windows: %#v", runner)
+	if len(runner.contexts) != 2 || runner.contexts[0] != runner.contexts[1] {
+		t.Fatalf("baseline and candidate did not share one method timeout: %#v", runner)
 	}
 }
 
-func TestMatchingTargetSupportsUniqueLegacyMethodNames(t *testing.T) {
+func TestMatchingTargetRejectsUnqualifiedLegacyMethodNames(t *testing.T) {
 	reference := domain.TargetRef{Language: "python", ScopeType: "symbol", Path: "sample.py", Symbol: "same"}
 	targets := []domain.VerificationTarget{{
 		ID: "first", Language: "python", ScopeType: "symbol", File: "sample.py", Symbol: "First.same",
 	}}
-	target, found := matchingTarget(reference, targets)
-	if !found || target.ID != "first" {
-		t.Fatalf("unique legacy method name did not match its qualified target: target=%#v found=%t", target, found)
-	}
-	targets = append(targets, domain.VerificationTarget{
-		ID: "second", Language: "python", ScopeType: "symbol", File: "sample.py", Symbol: "Second.same",
-	})
 	if target, found := matchingTarget(reference, targets); found {
-		t.Fatalf("ambiguous legacy method name matched arbitrarily: %#v", target)
+		t.Fatalf("unqualified approved symbol matched a qualified target: %#v", target)
+	}
+	reference.Symbol = "First.same"
+	if target, found := matchingTarget(reference, targets); !found || target.ID != "first" {
+		t.Fatalf("exact qualified target did not match: target=%#v found=%t", target, found)
 	}
 }
 
@@ -341,7 +335,6 @@ func TestReplayCapsuleRequiresCoreIssuedSeed(t *testing.T) {
 func TestManagedCallsUsePostExecutionContexts(t *testing.T) {
 	repository, base, head := testRepository(t, "before\n", "after\n")
 	output := filepath.Join(t.TempDir(), "run")
-	rawDiagnostic := "raw-managed-diagnostic " + filepath.Join(repository, "private", "source.go")
 	var localEvidencePresent atomic.Bool
 	var managedFMRequest atomic.Value
 	var uploadedPayload atomic.Value
@@ -365,7 +358,7 @@ func TestManagedCallsUsePostExecutionContexts(t *testing.T) {
 	}))
 	defer telemetryServer.Close()
 	policy := config.DefaultPolicy()
-	policy.Budgets.Total = domain.Duration(30 * time.Second)
+	policy.Budgets.Total = domain.Duration(time.Second)
 	policy.Commands = []domain.CommandSpec{{
 		ID: "tests", Category: domain.CategoryTestRegression, Command: []string{"test"}, Image: "image@sha256:abc",
 	}}
@@ -379,7 +372,7 @@ func TestManagedCallsUsePostExecutionContexts(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := (Planner{
-		Runner:          fakeRunner{err: fmt.Errorf("%s", rawDiagnostic)},
+		Runner:          deadlineRunner{},
 		FMClient:        managed.FMClient{Endpoint: fmServer.URL, AllowInsecure: true},
 		TelemetryClient: managed.TelemetryClient{Endpoint: telemetryServer.URL, AllowInsecure: true},
 	}).Analyze(context.Background(), Request{
@@ -394,20 +387,31 @@ func TestManagedCallsUsePostExecutionContexts(t *testing.T) {
 	if !localEvidencePresent.Load() {
 		t.Fatal("telemetry upload happened before evidence was persisted locally")
 	}
-	localDiagnosticPresent := false
-	for _, method := range result.Pack.Methods {
-		localDiagnosticPresent = localDiagnosticPresent || strings.Contains(method.Reason, rawDiagnostic)
-	}
-	if !localDiagnosticPresent {
-		t.Fatal("managed sanitization removed the diagnostic from local evidence")
-	}
 	fmPayload, _ := managedFMRequest.Load().(string)
 	payload, _ := uploadedPayload.Load().(string)
-	if strings.Contains(fmPayload, rawDiagnostic) || strings.Contains(fmPayload, repository) || strings.Contains(fmPayload, output) {
-		t.Fatalf("managed FM request exposed local diagnostics or paths: %s", fmPayload)
+	if strings.Contains(fmPayload, repository) || strings.Contains(fmPayload, output) {
+		t.Fatalf("managed FM request exposed local paths: %s", fmPayload)
 	}
-	if strings.Contains(payload, rawDiagnostic) || strings.Contains(payload, repository) || strings.Contains(payload, output) || !strings.Contains(payload, `"repository":"acme/repo"`) {
+	if strings.Contains(payload, repository) || strings.Contains(payload, output) || !strings.Contains(payload, `"repository":"acme/repo"`) {
 		t.Fatalf("managed payload exposed local paths or lost repository identity: %s", payload)
+	}
+}
+
+func TestManagedReviewPayloadPreservesAllowlistedSemantics(t *testing.T) {
+	targets := []domain.VerificationTarget{{
+		ID: "target", Language: "go", File: "internal/value.go", Symbol: "Value.Adjust", Kind: "method", ScopeType: "symbol",
+		ObservationCandidates: []domain.ObservationBoundary{{Kind: "unchanged_caller", Symbol: "Caller.Run", Path: "internal/caller.go"}},
+		Applicability: domain.RunApplicability{
+			Applicable: false, Reason: "effect risks require an approved stable observation boundary",
+			Risks: []string{"concurrency", "untrusted-secret-risk"},
+		},
+	}}
+	paths := map[string]struct{}{"internal/value.go": {}, "internal/caller.go": {}}
+	reviewTargets := managedReviewTargets(targets, paths)
+	reviewMethods := managedReviewMethodResults([]domain.MethodResult{{ID: "go_type_analysis", Status: domain.StatusRan}})
+	if reviewTargets[0].Symbol != "Value.Adjust" || reviewTargets[0].ObservationCandidates[0].Symbol != "Caller.Run" ||
+		!slices.Equal(reviewTargets[0].Applicability.Risks, []string{"concurrency"}) || reviewMethods[0].ID != "go_type_analysis" {
+		t.Fatalf("managed review lost safe semantic evidence: targets=%#v methods=%#v", reviewTargets, reviewMethods)
 	}
 }
 

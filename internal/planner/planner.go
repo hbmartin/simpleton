@@ -12,6 +12,7 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"slices"
 	"strings"
@@ -109,12 +110,14 @@ func (p Planner) Analyze(ctx context.Context, request Request) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	managedRepositoryPaths := map[string]struct{}{}
+	headPaths, err := repo.ListFiles(ctx, head)
+	if err != nil {
+		return Result{}, fmt.Errorf("list HEAD repository paths: %w", err)
+	}
+	managedRepositoryPaths := make(map[string]struct{}, len(headPaths))
 	if config.TelemetryAllowed(policy.Telemetry) == nil {
-		if paths, listErr := repo.ListFiles(ctx, head); listErr == nil {
-			for _, path := range paths {
-				managedRepositoryPaths[path] = struct{}{}
-			}
+		for _, path := range headPaths {
+			managedRepositoryPaths[path] = struct{}{}
 		}
 	}
 	patch, err := repo.Patch(ctx, base, head)
@@ -156,7 +159,7 @@ func (p Planner) Analyze(ctx context.Context, request Request) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	lockfiles, err := cache.LockfileDigests(ctx, repo, head)
+	lockfiles, err := cache.LockfileDigestsForPaths(ctx, repo, head, headPaths)
 	if err != nil {
 		return Result{}, err
 	}
@@ -259,10 +262,10 @@ func (p Planner) Analyze(ctx context.Context, request Request) (Result, error) {
 	hardCeilingExhausted := errors.Is(hardCtx.Err(), context.DeadlineExceeded)
 	if err := config.TelemetryAllowed(policy.Telemetry); err == nil && !hardCeilingExhausted {
 		fmCtx, fmCancel := context.WithTimeout(requestCtx, managedTimeout(policy, "managed_fm", 30*time.Second))
-		managedReviewPack := managedEvidencePack(pack, policy.Telemetry.Repository, managedRepositoryPaths)
 		pack.AdvisoryReview = p.FMClient.Review(fmCtx, managed.FMRequest{
-			Repository: policy.Telemetry.Repository, BaseRevision: base, HeadRevision: head,
-			Targets: managedReviewPack.Targets, Methods: managedReviewPack.Methods,
+			Repository: policy.Telemetry.Repository, BaseRevision: managedGitObjectID(base), HeadRevision: managedGitObjectID(head),
+			Targets:     managedReviewTargets(pack.Targets, managedRepositoryPaths),
+			Methods:     managedReviewMethodResults(pack.Methods),
 			Instruction: "Return advisory semantic-risk suspicion and explanation only. Do not claim proof, safety, or a Behavioral Witness.",
 		})
 		fmCancel()
@@ -702,7 +705,6 @@ func validSHA256(value string) bool {
 }
 
 func matchingTarget(reference domain.TargetRef, targets []domain.VerificationTarget) (domain.VerificationTarget, bool) {
-	var legacyMatches []domain.VerificationTarget
 	for _, target := range targets {
 		if target.Language != reference.Language || target.ScopeType != reference.ScopeType {
 			continue
@@ -710,19 +712,10 @@ func matchingTarget(reference domain.TargetRef, targets []domain.VerificationTar
 		if reference.Path != "" && target.File != reference.Path {
 			continue
 		}
-		if reference.Symbol != "" {
-			if target.Symbol == reference.Symbol {
-				return target, true
-			}
-			if !strings.Contains(reference.Symbol, ".") && strings.HasSuffix(target.Symbol, "."+reference.Symbol) {
-				legacyMatches = append(legacyMatches, target)
-			}
+		if reference.Symbol != "" && target.Symbol != reference.Symbol {
 			continue
 		}
 		return target, true
-	}
-	if len(legacyMatches) == 1 {
-		return legacyMatches[0], true
 	}
 	return domain.VerificationTarget{}, false
 }
@@ -788,12 +781,11 @@ func (p Planner) runCommands(ctx context.Context, baselineRepo, candidateRepo st
 		if image == "" {
 			image = policy.Execution.Image
 		}
-		baselineCtx, baselineCancel := context.WithTimeout(ctx, budget)
-		baseline, baselineErr := p.Runner.Run(baselineCtx, baselineRepo, policy.Execution, image, spec.Command)
-		baselineCancel()
+		methodCtx, methodCancel := context.WithTimeout(ctx, budget)
+		baseline, baselineErr := p.Runner.Run(methodCtx, baselineRepo, policy.Execution, image, spec.Command)
 		method := domain.MethodResult{ID: spec.ID, Language: spec.Language, Budget: budget.String(), Findings: []domain.Finding{}}
 		switch {
-		case errors.Is(baselineCtx.Err(), context.DeadlineExceeded) || errors.Is(baselineErr, context.DeadlineExceeded):
+		case errors.Is(methodCtx.Err(), context.DeadlineExceeded) || errors.Is(baselineErr, context.DeadlineExceeded):
 			method.Status = domain.StatusBudgetExhausted
 			method.Reason = "baseline command exceeded its policy budget"
 		case baselineErr != nil:
@@ -809,11 +801,9 @@ func (p Planner) runCommands(ctx context.Context, baselineRepo, candidateRepo st
 			method.Status = domain.StatusInconclusive
 			method.Reason = fmt.Sprintf("baseline command failed with exit code %d; a regression cannot be established", baseline.ExitCode)
 		default:
-			candidateCtx, candidateCancel := context.WithTimeout(ctx, budget)
-			candidate, candidateErr := p.Runner.Run(candidateCtx, candidateRepo, policy.Execution, image, spec.Command)
-			candidateCancel()
+			candidate, candidateErr := p.Runner.Run(methodCtx, candidateRepo, policy.Execution, image, spec.Command)
 			switch {
-			case errors.Is(candidateCtx.Err(), context.DeadlineExceeded) || errors.Is(candidateErr, context.DeadlineExceeded):
+			case errors.Is(methodCtx.Err(), context.DeadlineExceeded) || errors.Is(candidateErr, context.DeadlineExceeded):
 				method.Status = domain.StatusBudgetExhausted
 				method.Reason = "candidate command exceeded its policy budget"
 			case candidateErr != nil:
@@ -836,6 +826,7 @@ func (p Planner) runCommands(ctx context.Context, baselineRepo, candidateRepo st
 				method.Status = domain.StatusRan
 			}
 		}
+		methodCancel()
 		method.DurationMS = time.Since(started).Milliseconds()
 		results = append(results, method)
 	}
@@ -1022,6 +1013,59 @@ func managedTargets(targets []domain.VerificationTarget, repositoryPaths map[str
 	return result
 }
 
+var managedSemanticSymbolPattern = regexp.MustCompile(`^(?:<module>|[A-Za-z_$][A-Za-z0-9_.$]*)$`)
+
+func managedSemanticSymbol(value string) string {
+	if len(value) > 256 || !managedSemanticSymbolPattern.MatchString(value) {
+		return ""
+	}
+	return value
+}
+
+func managedReviewTargets(targets []domain.VerificationTarget, repositoryPaths map[string]struct{}) []domain.VerificationTarget {
+	result := managedTargets(targets, repositoryPaths)
+	for index := range result {
+		result[index].Symbol = managedSemanticSymbol(targets[index].Symbol)
+		result[index].Applicability.Reason = managedApplicabilityReason(targets[index].Applicability.Reason)
+		result[index].Applicability.Risks = managedRisks(targets[index].Applicability.Risks)
+		for boundaryIndex := range result[index].ObservationCandidates {
+			result[index].ObservationCandidates[boundaryIndex].Symbol = managedSemanticSymbol(targets[index].ObservationCandidates[boundaryIndex].Symbol)
+		}
+	}
+	return result
+}
+
+func managedApplicabilityReason(value string) string {
+	return managedEnum(value,
+		"no statically detected effects",
+		"effect risks require an approved stable observation boundary",
+		"dynamic or effect risks require an approved stable observation boundary",
+	)
+}
+
+var managedRiskAllowlist = []string{
+	"async", "async_or_generator", "channel_send", "concurrency", "external_state_write", "time",
+	"call_fetch", "call_now", "call_open", "call_print", "call_random", "call_readFile", "call_recv",
+	"call_request", "call_send", "call_setInterval", "call_setTimeout", "call_sleep", "call_time",
+	"call_uuid4", "call_writeFile",
+	"imports_asyncio", "imports_child_process", "imports_crypto", "imports_crypto_rand", "imports_database_sql",
+	"imports_fs", "imports_http", "imports_https", "imports_io", "imports_math_rand", "imports_net",
+	"imports_net_http", "imports_node_child_process", "imports_node_crypto", "imports_node_fs", "imports_node_http",
+	"imports_node_https", "imports_node_net", "imports_node_timers", "imports_node_worker_threads", "imports_os",
+	"imports_random", "imports_secrets", "imports_socket", "imports_subprocess", "imports_sync", "imports_threading",
+	"imports_time", "imports_timers", "imports_worker_threads",
+}
+
+func managedRisks(risks []string) []string {
+	result := make([]string, 0, len(risks))
+	for _, risk := range risks {
+		if managed := managedEnum(risk, managedRiskAllowlist...); managed != "" {
+			result = append(result, managed)
+		}
+	}
+	return result
+}
+
 func managedMethodResults(methods []domain.MethodResult) []domain.MethodResult {
 	result := make([]domain.MethodResult, 0, len(methods))
 	for _, method := range methods {
@@ -1034,6 +1078,16 @@ func managedMethodResults(methods []domain.MethodResult) []domain.MethodResult {
 			managed.Applicability = &domain.RunApplicability{Applicable: method.Applicability.Applicable, Confidence: method.Applicability.Confidence}
 		}
 		result = append(result, managed)
+	}
+	return result
+}
+
+func managedReviewMethodResults(methods []domain.MethodResult) []domain.MethodResult {
+	result := managedMethodResults(methods)
+	for index := range result {
+		if semanticID := managedSemanticSymbol(methods[index].ID); semanticID != "" {
+			result[index].ID = semanticID
+		}
 	}
 	return result
 }

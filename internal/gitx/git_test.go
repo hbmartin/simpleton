@@ -237,6 +237,9 @@ func TestWorktreeDigestEnforcesFileAndNestedRepositoryLimits(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "digest limit") {
 		t.Fatalf("oversized untracked file was not rejected: %v", err)
 	}
+	if strings.Contains(err.Error(), "remained unreadable") {
+		t.Fatalf("deterministic size failure was retried and misattributed: %v", err)
+	}
 
 	path := t.TempDir()
 	gitCommand(t, path, "init", "-q")

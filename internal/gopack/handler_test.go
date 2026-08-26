@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -305,6 +306,37 @@ func TestAnalyzeSkipsUnrelatedPackageTypeChecking(t *testing.T) {
 	}
 }
 
+func TestAnalyzeMethodChangeSkipsUnrelatedPackageTypeChecking(t *testing.T) {
+	repo := t.TempDir()
+	git(t, repo, "init", "-q")
+	git(t, repo, "config", "user.email", "simpleton@example.invalid")
+	git(t, repo, "config", "user.name", "Simpleton Test")
+	write(t, filepath.Join(repo, "go.mod"), "module example.invalid/scopedmethod\n\ngo 1.24\n")
+	write(t, filepath.Join(repo, "dep", "value.go"), "package dep\n\ntype Value struct{}\nfunc (Value) Adjust(value int) int { return value }\n")
+	write(t, filepath.Join(repo, "caller", "caller.go"), "package caller\n\nimport \"example.invalid/scopedmethod/dep\"\nfunc Public(value int) int { return (dep.Value{}).Adjust(value) }\n")
+	write(t, filepath.Join(repo, "unrelated", "broken.go"), "package unrelated\n\nvar Broken int = \"not an int\"\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-qm", "base")
+	base := git(t, repo, "rev-parse", "HEAD")
+	write(t, filepath.Join(repo, "dep", "value.go"), "package dep\n\ntype Value struct{}\nfunc (Value) Adjust(value int) int { return value + 1 }\n")
+	git(t, repo, "commit", "-qam", "candidate")
+	head := git(t, repo, "rev-parse", "HEAD")
+
+	result, err := (Handler{}).Analyze(context.Background(), packrpc.AnalyzeParams{
+		Repository: repo, BaseRevision: base, HeadRevision: head,
+		ChangedFiles: []gitx.ChangedFile{{Path: "dep/value.go", Language: "go"}}, BudgetMS: 10_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Methods[1].Status != domain.StatusRan {
+		t.Fatalf("unrelated package diagnostics contaminated method analysis: %#v", result.Methods[1])
+	}
+	if len(result.Targets) != 1 || result.Targets[0].Symbol != "Value.Adjust" {
+		t.Fatalf("changed method target is missing: %#v", result.Targets)
+	}
+}
+
 func TestModuleMetadataDerivesPackagePathsWithoutCompilingRepository(t *testing.T) {
 	repo := t.TempDir()
 	git(t, repo, "init", "-q")
@@ -355,6 +387,24 @@ func TestParseRepositoryFallsBackPerPathAfterBatchFailure(t *testing.T) {
 	}
 	if parsed["main.go"] == nil {
 		t.Fatalf("valid blob was discarded after batch failure: %#v", parsed)
+	}
+}
+
+func TestParseRepositoryReportsBatchAndFallbackReadFailure(t *testing.T) {
+	repo := t.TempDir()
+	git(t, repo, "init", "-q")
+	git(t, repo, "config", "user.email", "simpleton@example.invalid")
+	git(t, repo, "config", "user.name", "Simpleton Test")
+	write(t, filepath.Join(repo, "main.go"), "package sample\n\nfunc Example() {}\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-qm", "sample")
+	repository, err := gitx.Open(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, _, err = parseRepository(context.Background(), repository, "HEAD\ninvalid", []string{"main.go"}, map[string]bool{"main.go": true})
+	if err == nil || !strings.Contains(err.Error(), "batch-read Go sources") || !strings.Contains(err.Error(), "fallback failures") {
+		t.Fatalf("hard repository read failure was not reported: %v", err)
 	}
 }
 

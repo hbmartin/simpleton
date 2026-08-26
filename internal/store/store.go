@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/haroldmartin/simpleton/internal/domain"
@@ -34,7 +35,7 @@ func Open(root string) (*Store, error) {
 	if err := os.MkdirAll(objects, 0o700); err != nil {
 		return nil, err
 	}
-	databaseURL := url.URL{Scheme: "file", Path: filepath.Join(root, "simpleton.db")}
+	databaseURL := sqliteFileURL(filepath.Join(root, "simpleton.db"))
 	query := databaseURL.Query()
 	query.Set("_foreign_keys", "on")
 	query.Set("_journal_mode", "WAL")
@@ -50,6 +51,22 @@ func Open(root string) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+func sqliteFileURL(filename string) url.URL {
+	slashed := filepath.ToSlash(filename)
+	if len(filename) >= 3 && ((filename[0] >= 'A' && filename[0] <= 'Z') || (filename[0] >= 'a' && filename[0] <= 'z')) &&
+		filename[1] == ':' && (filename[2] == '\\' || filename[2] == '/') {
+		return url.URL{Scheme: "file", Path: "/" + strings.ReplaceAll(filename, "\\", "/")}
+	}
+	if strings.HasPrefix(filename, `\\`) || strings.HasPrefix(filename, "//") {
+		unc := strings.TrimPrefix(strings.ReplaceAll(filename, "\\", "/"), "//")
+		host, path, found := strings.Cut(unc, "/")
+		if found && host != "" {
+			return url.URL{Scheme: "file", Host: host, Path: "/" + path}
+		}
+	}
+	return url.URL{Scheme: "file", Path: slashed}
 }
 
 func (s *Store) Close() error { return s.db.Close() }

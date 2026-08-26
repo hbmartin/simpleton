@@ -53,6 +53,21 @@ test("uses qualified 64-bit target identities", async (t) => {
   assert.ok(targets.every((target) => target.observation_candidates.every((boundary) => boundary.kind !== "unchanged_caller")));
 });
 
+test("gives anonymous default class methods a collision-free scope", async (t) => {
+  const { repo, revision } = await repository(t, {
+    "sample.ts": "function same() { return 1; }\nexport default class { same() { return 2; } }\n",
+  });
+  const responses = await runPack([
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocol_version: "1" } },
+    { jsonrpc: "2.0", id: 2, method: "analyze", params: {
+      repository: repo, head_revision: revision, changed_files: [{ path: "sample.ts", language: "typescript" }], budget_ms: 1000,
+    } },
+  ]);
+  const targets = responses[1].result.targets;
+  assert.deepEqual(new Set(targets.map((target) => target.symbol)), new Set(["same", "default.same"]));
+  assert.equal(new Set(targets.map((target) => target.id)).size, 2);
+});
+
 test("restores caller scope after nested functions", async (t) => {
   const { repo, revision } = await repository(t, {
     "target.ts": "export function target() { return 1; }\n",

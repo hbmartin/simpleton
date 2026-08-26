@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -39,9 +40,16 @@ func LockfileDigests(ctx context.Context, repository gitx.Repository, revision s
 	if err != nil {
 		return nil, err
 	}
+	return LockfileDigestsForPaths(ctx, repository, revision, paths)
+}
+
+// LockfileDigestsForPaths hashes lockfiles from an already validated tree
+// listing so callers that also need repository paths do not walk it twice.
+func LockfileDigestsForPaths(ctx context.Context, repository gitx.Repository, revision string, paths []string) (map[string]string, error) {
 	result := map[string]string{}
-	sort.Strings(paths)
-	for _, path := range paths {
+	ordered := slices.Clone(paths)
+	sort.Strings(ordered)
+	for _, path := range ordered {
 		if !isLockfile(path) {
 			continue
 		}
