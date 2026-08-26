@@ -2,15 +2,20 @@ package planner
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"math/big"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/haroldmartin/simpleton/internal/cache"
 	"github.com/haroldmartin/simpleton/internal/config"
@@ -229,28 +234,25 @@ func (p Planner) Analyze(ctx context.Context, request Request) (Result, error) {
 	}
 
 	if err := config.TelemetryAllowed(policy.Telemetry); err == nil {
-		pack.AdvisoryReview = p.FMClient.Review(runCtx, managed.FMRequest{
+		fmCtx, fmCancel := context.WithTimeout(ctx, managedTimeout(policy, "managed_fm", 30*time.Second))
+		pack.AdvisoryReview = p.FMClient.Review(fmCtx, managed.FMRequest{
 			Repository: policy.Telemetry.Repository, BaseRevision: base, HeadRevision: head,
 			Targets: pack.Targets, Methods: pack.Methods,
 			Instruction: "Return advisory semantic-risk suspicion and explanation only. Do not claim proof, safety, or a Behavioral Witness.",
 		})
+		fmCancel()
 	} else {
 		pack.AdvisoryReview = domain.AdvisoryReview{Status: domain.StatusUnsupported, Reason: err.Error()}
 	}
 
 	pack.Blockers = policy.SelectBlockers(pack)
+	uploadCtx, uploadCancel := context.WithTimeout(ctx, managedTimeout(policy, "telemetry_upload", 15*time.Second))
+	pack.Telemetry = p.upload(uploadCtx, policy, pack)
+	uploadCancel()
 	if err := report.WriteAll(output, pack); err != nil {
 		return Result{}, err
 	}
 	digest, err := state.SaveEvidence(ctx, pack)
-	if err != nil {
-		return Result{}, err
-	}
-	pack.Telemetry = p.upload(runCtx, policy, pack)
-	if err := report.WriteAll(output, pack); err != nil {
-		return Result{}, err
-	}
-	digest, err = state.SaveEvidence(ctx, pack)
 	if err != nil {
 		return Result{}, err
 	}
@@ -299,52 +301,345 @@ func (p Planner) runContractProbes(ctx context.Context, request Request, policy 
 		}
 		probeCtx, cancel := context.WithTimeout(ctx, budget)
 		started := time.Now()
-		_, probed, err := (&packrpc.Client{Command: command}).InitializeAndProbe(probeCtx, request.CoreVersion, packrpc.ProbeParams{
+		replayBudget := budget / 2
+		if replayBudget <= 0 {
+			replayBudget = budget
+		}
+		params := packrpc.ProbeParams{
 			ProtocolVersion: domain.ProtocolVersion, Target: target, Observation: observation,
-			BudgetMS: budget.Milliseconds(), Seed: domain.StableID(pack.RunID, target.ID, observation.ID),
-		})
+			BudgetMS: replayBudget.Milliseconds(), Seed: domain.StableID(pack.RunID, target.ID, observation.ID),
+		}
+		_, first, firstErr := (&packrpc.Client{Command: command}).InitializeAndProbe(probeCtx, request.CoreVersion, params)
+		var second packrpc.ProbeResult
+		var secondErr error
+		if firstErr == nil && first.Method.Status == domain.StatusRan {
+			_, second, secondErr = (&packrpc.Client{Command: command}).InitializeAndProbe(probeCtx, request.CoreVersion, params)
+		}
 		cancel()
 		wrapper := domain.MethodResult{ID: methodID, Language: target.Language, Budget: budget.String(), DurationMS: time.Since(started).Milliseconds()}
 		switch {
 		case errors.Is(probeCtx.Err(), context.DeadlineExceeded):
 			wrapper.Status = domain.StatusBudgetExhausted
 			wrapper.Reason = "probe exceeded its policy budget"
-		case err != nil:
+		case firstErr != nil:
 			wrapper.Status = domain.StatusExecutionFailed
-			wrapper.Reason = err.Error()
+			wrapper.Reason = firstErr.Error()
+		case secondErr != nil:
+			wrapper.Status = domain.StatusExecutionFailed
+			wrapper.Reason = "independent replay failed: " + secondErr.Error()
 		default:
 			wrapper.Status = domain.StatusRan
 		}
 		pack.Methods = append(pack.Methods, wrapper)
-		if err != nil {
+		if firstErr != nil {
 			continue
 		}
-		pack.Methods = append(pack.Methods, probed.Method)
-		if probed.Method.Status == domain.StatusRan {
-			anyRan = true
+		pack.Methods = append(pack.Methods, first.Method)
+		if first.Method.Status != domain.StatusRan {
+			continue
 		}
-		pack.ReplayCapsules = append(pack.ReplayCapsules, probed.Capsules...)
-		for _, divergence := range probed.Divergences {
-			if divergence.TargetID == "" {
-				divergence.TargetID = target.ID
-			}
-			if divergence.ObservationSpecID == "" {
-				divergence.ObservationSpecID = observation.ID
-			}
-			pack.Divergences = append(pack.Divergences, divergence)
-			violated, _, compareErr := witness.Compare(observation.Comparator, observation.Tolerances, divergence.BeforeObservation, divergence.AfterObservation)
-			if compareErr != nil || !violated || !capsulePresent(divergence.ReplayCapsuleDigest, probed.Capsules) {
-				continue
-			}
-			validated, promoteErr := witness.Promote(
-				divergence, pack.Approval.Approved, contractDigest, divergence.PreconditionEvidence, true,
+		validation := domain.MethodResult{ID: methodID + "_validation", Language: target.Language, Budget: budget.String(), Status: domain.StatusRan}
+		if secondErr != nil || second.Method.Status != domain.StatusRan {
+			validation.Status = domain.StatusInconclusive
+			validation.Reason = "two successful independent probe runs are required"
+			pack.Methods = append(pack.Methods, validation)
+			pack.Divergences = append(pack.Divergences, first.Divergences...)
+			continue
+		}
+		anyRan = true
+		if matched, reason := matchingDivergenceSet(first.Divergences, second.Divergences); !matched {
+			validation.Status = domain.StatusFlaky
+			validation.Reason = reason
+			pack.Methods = append(pack.Methods, validation)
+			pack.Divergences = append(pack.Divergences, first.Divergences...)
+			continue
+		}
+		pack.ReplayCapsules = append(pack.ReplayCapsules, first.Capsules...)
+		validationReasons := []string{}
+		validationStatus := domain.StatusRan
+		for _, reported := range first.Divergences {
+			validated, witnessValue, status, reason := validateIndependentReplay(
+				observation, target, params.Seed, contractDigest, pack, reported, first.Capsules, second,
 			)
-			if promoteErr == nil {
-				pack.Witnesses = append(pack.Witnesses, validated)
+			pack.Divergences = append(pack.Divergences, validated)
+			if witnessValue != nil {
+				pack.Witnesses = append(pack.Witnesses, *witnessValue)
+			}
+			if reason != "" {
+				validationReasons = append(validationReasons, reported.ID+": "+reason)
+			}
+			if status == domain.StatusFlaky {
+				validationStatus = domain.StatusFlaky
+			} else if status != domain.StatusRan && validationStatus == domain.StatusRan {
+				validationStatus = status
 			}
 		}
+		validation.Status = validationStatus
+		validation.Reason = strings.Join(validationReasons, "; ")
+		pack.Methods = append(pack.Methods, validation)
 	}
 	return anyRan
+}
+
+func validateIndependentReplay(observation domain.ObservationSpec, target domain.VerificationTarget, seed, contractDigest string, pack *domain.EvidencePack, first domain.ObservedDivergence, firstCapsules []domain.ReplayCapsule, secondResult packrpc.ProbeResult) (domain.ObservedDivergence, *domain.BehavioralWitness, domain.MethodStatus, string) {
+	recorded := first
+	recorded.TargetID = target.ID
+	recorded.ObservationSpecID = observation.ID
+	if first.ID == "" {
+		return recorded, nil, domain.StatusInconclusive, "probe divergence has no stable ID"
+	}
+	if first.TargetID != "" && first.TargetID != target.ID {
+		return recorded, nil, domain.StatusInconclusive, "probe divergence target does not match the approved Observation Spec"
+	}
+	if first.ObservationSpecID != "" && first.ObservationSpecID != observation.ID {
+		return recorded, nil, domain.StatusInconclusive, "probe divergence observation ID does not match the approved Observation Spec"
+	}
+	second, found := divergenceByID(first.ID, secondResult.Divergences)
+	if !found {
+		return recorded, nil, domain.StatusFlaky, "independent replay did not reproduce the divergence"
+	}
+	if second.TargetID != "" && second.TargetID != target.ID || second.ObservationSpecID != "" && second.ObservationSpecID != observation.ID {
+		return recorded, nil, domain.StatusFlaky, "independent replay changed the target or Observation Spec identity"
+	}
+	firstFixtureDigest, firstFixtureErr := domain.DigestJSON(first.FixtureOrInput)
+	secondFixtureDigest, secondFixtureErr := domain.DigestJSON(second.FixtureOrInput)
+	if firstFixtureErr != nil || secondFixtureErr != nil || firstFixtureDigest != secondFixtureDigest {
+		return recorded, nil, domain.StatusFlaky, "independent replay did not use the same fixture"
+	}
+	domainEvidence, legal, domainReason := approvedInputEvidence(observation, first.FixtureOrInput)
+	if !legal {
+		return recorded, nil, domain.StatusInconclusive, domainReason
+	}
+	secondEvidence, secondLegal, secondDomainReason := approvedInputEvidence(observation, second.FixtureOrInput)
+	if !secondLegal {
+		return recorded, nil, domain.StatusInconclusive, "independent replay input: " + secondDomainReason
+	}
+	if !reflect.DeepEqual(domainEvidence, secondEvidence) {
+		return recorded, nil, domain.StatusFlaky, "independent replay did not establish the same domain evidence"
+	}
+	assessment, err := witness.AssessReplays(observation.Comparator, observation.Tolerances, []witness.ObservationPair{
+		{Before: first.BeforeObservation, After: first.AfterObservation, LegalInput: true, DomainEvidence: domainEvidence},
+		{Before: second.BeforeObservation, After: second.AfterObservation, LegalInput: true, DomainEvidence: secondEvidence},
+	})
+	if err != nil {
+		return recorded, nil, domain.StatusInconclusive, "core comparator validation failed: " + err.Error()
+	}
+	if assessment.Status != domain.StatusRan || !assessment.Stable {
+		return recorded, nil, assessment.Status, assessment.Reason
+	}
+	recorded.Status = assessment.Outcome
+	recorded.Stable = assessment.Stable
+	recorded.ReplayCount = assessment.Replays
+	recorded.BeforeObservation = assessment.Before
+	recorded.AfterObservation = assessment.After
+	recorded.PreconditionEvidence = domainEvidence
+	recorded.Comparator = observation.Comparator.BuiltIn
+	if recorded.Comparator == "" {
+		recorded.Comparator = observation.Comparator.Symbol
+	}
+	if assessment.Outcome != domain.ObservationDivergenceConfirmed {
+		return recorded, nil, domain.StatusRan, "approved comparator was not violated"
+	}
+	firstCapsule, found := matchingCapsule(first.ReplayCapsuleDigest, firstCapsules)
+	if !found {
+		return recorded, nil, domain.StatusInconclusive, "reported Replay Capsule was not returned by the first probe"
+	}
+	secondCapsule, found := matchingCapsule(second.ReplayCapsuleDigest, secondResult.Capsules)
+	if !found || firstCapsule.Digest != secondCapsule.Digest || !reflect.DeepEqual(firstCapsule, secondCapsule) {
+		return recorded, nil, domain.StatusFlaky, "independent replay did not reproduce the same Replay Capsule"
+	}
+	if reason := validateReplayCapsule(firstCapsule, seed, recorded.Comparator); reason != "" {
+		return recorded, nil, domain.StatusInconclusive, reason
+	}
+	recorded.ReplayCapsuleDigest = firstCapsule.Digest
+	recorded.EnvironmentDigest = pack.Provenance.EnvironmentDigest
+	baselineDigest, err := domain.DigestJSON(assessment.Before)
+	if err != nil {
+		return recorded, nil, domain.StatusInconclusive, "digest baseline observation: " + err.Error()
+	}
+	candidateDigest, err := domain.DigestJSON(assessment.After)
+	if err != nil {
+		return recorded, nil, domain.StatusInconclusive, "digest candidate observation: " + err.Error()
+	}
+	recorded.BaselineArtifactDigest = baselineDigest
+	recorded.CandidateArtifactDigest = candidateDigest
+	validatedWitness, err := witness.Promote(recorded, pack.Approval.Approved, contractDigest, domainEvidence, true)
+	if err != nil {
+		return recorded, nil, domain.StatusInconclusive, "witness promotion rejected: " + err.Error()
+	}
+	return recorded, &validatedWitness, domain.StatusRan, ""
+}
+
+func divergenceByID(id string, divergences []domain.ObservedDivergence) (domain.ObservedDivergence, bool) {
+	for _, divergence := range divergences {
+		if divergence.ID == id {
+			return divergence, true
+		}
+	}
+	return domain.ObservedDivergence{}, false
+}
+
+func matchingDivergenceSet(first, second []domain.ObservedDivergence) (bool, string) {
+	if len(first) != len(second) {
+		return false, "independent replay changed the set of reported divergences"
+	}
+	identifiers := map[string]bool{}
+	for _, divergence := range first {
+		if divergence.ID == "" || identifiers[divergence.ID] {
+			return false, "probe returned missing or duplicate divergence IDs"
+		}
+		identifiers[divergence.ID] = true
+	}
+	for _, divergence := range second {
+		if !identifiers[divergence.ID] {
+			return false, "independent replay changed the set of reported divergences"
+		}
+		delete(identifiers, divergence.ID)
+	}
+	return len(identifiers) == 0, ""
+}
+
+func approvedInputEvidence(observation domain.ObservationSpec, fixture any) ([]string, bool, string) {
+	if observation.Inputs == nil {
+		return nil, false, "generated inputs require an independent domain validator"
+	}
+	fixtureDigest, err := domain.DigestJSON(fixture)
+	if err != nil {
+		return nil, false, "fixture cannot be canonically encoded: " + err.Error()
+	}
+	matched := false
+	for _, approved := range observation.Inputs {
+		digest, err := domain.DigestJSON(approved)
+		if err == nil && digest == fixtureDigest {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return nil, false, "fixture was not one of the approved explicit inputs"
+	}
+	evidence := []string{"fixture matched an approved explicit input"}
+	for _, precondition := range observation.Preconditions {
+		if precondition.Symbol != "" {
+			return nil, false, "repository precondition symbols require an independent core validator"
+		}
+		if ok, reason := evaluateBuiltInPrecondition(precondition.BuiltIn, fixture); !ok {
+			return nil, false, reason
+		}
+		evidence = append(evidence, "core validated precondition "+precondition.BuiltIn)
+	}
+	return evidence, true, ""
+}
+
+func evaluateBuiltInPrecondition(name string, fixture any) (bool, string) {
+	switch name {
+	case "always", "seeded_values":
+		return true, ""
+	case "non_null":
+		if fixture != nil {
+			return true, ""
+		}
+	case "non_negative":
+		if value, ok := numericFixture(fixture); ok && value.Sign() >= 0 {
+			return true, ""
+		}
+	case "finite":
+		if finiteFixture(fixture) {
+			return true, ""
+		}
+	case "valid_utf8":
+		if value, ok := fixture.(string); ok && utf8.ValidString(value) {
+			return true, ""
+		}
+	default:
+		return false, fmt.Sprintf("built-in precondition %q has no independent core validator", name)
+	}
+	return false, fmt.Sprintf("fixture failed built-in precondition %q", name)
+}
+
+func numericFixture(value any) (*big.Rat, bool) {
+	switch value := value.(type) {
+	case json.Number:
+		number, ok := new(big.Rat).SetString(string(value))
+		return number, ok
+	case float64:
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return nil, false
+		}
+		return new(big.Rat).SetFloat64(value), true
+	case float32:
+		return numericFixture(float64(value))
+	case int:
+		return new(big.Rat).SetInt64(int64(value)), true
+	case int8:
+		return new(big.Rat).SetInt64(int64(value)), true
+	case int16:
+		return new(big.Rat).SetInt64(int64(value)), true
+	case int32:
+		return new(big.Rat).SetInt64(int64(value)), true
+	case int64:
+		return new(big.Rat).SetInt64(value), true
+	case uint:
+		return new(big.Rat).SetUint64(uint64(value)), true
+	case uint8:
+		return new(big.Rat).SetUint64(uint64(value)), true
+	case uint16:
+		return new(big.Rat).SetUint64(uint64(value)), true
+	case uint32:
+		return new(big.Rat).SetUint64(uint64(value)), true
+	case uint64:
+		return new(big.Rat).SetUint64(value), true
+	default:
+		return nil, false
+	}
+}
+
+func finiteFixture(value any) bool {
+	if number, ok := numericFixture(value); ok {
+		return number != nil
+	}
+	return false
+}
+
+func matchingCapsule(digest string, capsules []domain.ReplayCapsule) (domain.ReplayCapsule, bool) {
+	if digest == "" {
+		return domain.ReplayCapsule{}, false
+	}
+	for _, capsule := range capsules {
+		if capsule.Digest == digest {
+			return capsule, true
+		}
+	}
+	return domain.ReplayCapsule{}, false
+}
+
+func validateReplayCapsule(capsule domain.ReplayCapsule, seed, comparator string) string {
+	if !validSHA256(capsule.Digest) {
+		return "Replay Capsule digest is not a SHA-256 value"
+	}
+	if len(capsule.ObjectDigests) == 0 || len(capsule.ReplayCommand) == 0 {
+		return "Replay Capsule must include content-addressed objects and a replay command"
+	}
+	for _, digest := range capsule.ObjectDigests {
+		if !validSHA256(digest) {
+			return "Replay Capsule contains a non-SHA-256 object digest"
+		}
+	}
+	if capsule.Seed != "" && capsule.Seed != seed {
+		return "Replay Capsule seed does not match the core-issued seed"
+	}
+	if capsule.Comparator != comparator {
+		return "Replay Capsule comparator does not match the approved comparator"
+	}
+	return ""
+}
+
+func validSHA256(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func matchingTarget(reference domain.TargetRef, targets []domain.VerificationTarget) (domain.VerificationTarget, bool) {
@@ -370,18 +665,6 @@ func capabilityFor(language string, capabilities []domain.PackCapability) (domai
 		}
 	}
 	return domain.PackCapability{}, false
-}
-
-func capsulePresent(digest string, capsules []domain.ReplayCapsule) bool {
-	if digest == "" {
-		return false
-	}
-	for _, capsule := range capsules {
-		if capsule.Digest == digest {
-			return true
-		}
-	}
-	return false
 }
 
 func (p Planner) resolveIntent(request Request, changed []gitx.ChangedFile, base, head, output string) (domain.ChangeIntent, string, domain.ApprovalContext, bool, string, error) {
@@ -524,6 +807,13 @@ func (p Planner) upload(ctx context.Context, policy domain.Policy, pack domain.E
 		return domain.TelemetryOutcome{Status: "upload_failed", Reason: err.Error(), Redactions: redactions, RetentionDays: 30}
 	}
 	return domain.TelemetryOutcome{Status: "uploaded", Redactions: redactions, RemoteID: remoteID, RetentionDays: 30}
+}
+
+func managedTimeout(policy domain.Policy, method string, fallback time.Duration) time.Duration {
+	if configured, ok := policy.Budgets.Methods[method]; ok {
+		return configured.Duration()
+	}
+	return fallback
 }
 
 func groupFiles(files []gitx.ChangedFile) map[string][]gitx.ChangedFile {

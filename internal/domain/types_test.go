@@ -56,6 +56,15 @@ func TestPolicyRejectsUnsafeBlockingAndBudget(t *testing.T) {
 	}
 }
 
+func TestBlockingPolicyRequiresExplicitAllowedCategory(t *testing.T) {
+	policy := testPolicy()
+	policy.Mode = "blocking"
+	policy.Blocking.Allow = nil
+	if err := policy.Validate(); err == nil {
+		t.Fatal("blocking mode with no allowed categories must be rejected")
+	}
+}
+
 func TestNonRanMethodStatusesCannotBlock(t *testing.T) {
 	policy := testPolicy()
 	policy.Mode = "blocking"

@@ -1,6 +1,7 @@
 package witness
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/haroldmartin/simpleton/internal/domain"
@@ -11,6 +12,15 @@ func TestStructuralJSONIgnoresMapOrdering(t *testing.T) {
 		`{"b":2,"a":1}`, `{"a":1,"b":2}`)
 	if err != nil || violated {
 		t.Fatalf("expected equivalent structures, violated=%t err=%v", violated, err)
+	}
+}
+
+func TestExactComparisonPreservesLargeIntegerPrecision(t *testing.T) {
+	before := json.Number("9007199254740992")
+	after := json.Number("9007199254740993")
+	violated, _, err := Compare(domain.ComparatorSpec{BuiltIn: "exact"}, nil, before, after)
+	if err != nil || !violated {
+		t.Fatalf("distinct integers beyond float64 precision must differ: violated=%t err=%v", violated, err)
 	}
 }
 

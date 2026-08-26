@@ -497,6 +497,9 @@ func (p Policy) Validate() error {
 	if p.Mode != "shadow" && p.Mode != "blocking" {
 		errs = append(errs, errors.New("policy mode must be shadow or blocking"))
 	}
+	if p.Mode == "blocking" && len(p.Blocking.Allow) == 0 {
+		errs = append(errs, errors.New("blocking mode requires at least one allowed blocking category"))
+	}
 	if p.Budgets.Total.Duration() <= 0 || p.Budgets.HardCeiling.Duration() <= 0 {
 		errs = append(errs, errors.New("policy budgets must be positive"))
 	}

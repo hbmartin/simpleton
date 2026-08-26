@@ -155,15 +155,33 @@ func (r Repository) WorktreeDigest(ctx context.Context) (string, error) {
 			continue
 		}
 		path := string(rawPath)
-		content, readErr := os.ReadFile(filepath.Join(r.Path, filepath.FromSlash(path)))
+		content, kind, readErr := readWorktreeEntry(filepath.Join(r.Path, filepath.FromSlash(path)))
 		if readErr != nil {
-			return "", readErr
+			return "", fmt.Errorf("read untracked path %q: %w", path, readErr)
 		}
 		_, _ = hash.Write(rawPath)
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(kind))
 		_, _ = hash.Write([]byte{0})
 		_, _ = hash.Write(content)
 	}
 	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+func readWorktreeEntry(path string) ([]byte, string, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(path)
+		return []byte(target), "symlink", err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, "", fmt.Errorf("unsupported file type %s", info.Mode().Type())
+	}
+	content, err := os.ReadFile(path)
+	return content, "regular", err
 }
 
 func (r Repository) DetachedWorktree(ctx context.Context, revision string) (string, func() error, error) {

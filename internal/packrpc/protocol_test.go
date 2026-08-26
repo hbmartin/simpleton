@@ -83,3 +83,16 @@ func TestBudgetContextExpires(t *testing.T) {
 		t.Fatal("budget context did not expire")
 	}
 }
+
+func TestDecodeJSONPreservesLargeNumbers(t *testing.T) {
+	var decoded struct {
+		Value any `json:"value"`
+	}
+	if err := decodeJSON([]byte(`{"value":9007199254740993}`), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	number, ok := decoded.Value.(json.Number)
+	if !ok || string(number) != "9007199254740993" {
+		t.Fatalf("large JSON number lost precision: %#v", decoded.Value)
+	}
+}

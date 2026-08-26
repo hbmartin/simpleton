@@ -2,6 +2,9 @@ package planner
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,11 +15,20 @@ import (
 	"github.com/haroldmartin/simpleton/internal/config"
 	"github.com/haroldmartin/simpleton/internal/domain"
 	"github.com/haroldmartin/simpleton/internal/execution"
+	"github.com/haroldmartin/simpleton/internal/managed"
+	"github.com/haroldmartin/simpleton/internal/packrpc"
 )
 
 type fakeRunner struct {
 	result execution.CommandResult
 	err    error
+}
+
+type deadlineRunner struct{}
+
+func (deadlineRunner) Run(ctx context.Context, _ string, _ domain.ExecutionPolicy, _ string, _ []string) (execution.CommandResult, error) {
+	<-ctx.Done()
+	return execution.CommandResult{}, ctx.Err()
 }
 
 func (f fakeRunner) Run(context.Context, string, domain.ExecutionPolicy, string, []string) (execution.CommandResult, error) {
@@ -78,6 +90,97 @@ func TestBudgetExhaustionCannotBlock(t *testing.T) {
 	}
 	if result.ExitCode != 0 || len(result.Pack.Blockers) != 0 || result.Pack.Methods[1].Status != domain.StatusBudgetExhausted {
 		t.Fatalf("budget exhaustion must be nonblocking: %#v", result)
+	}
+}
+
+func TestIndependentReplayDerivesWitnessConditionsInCore(t *testing.T) {
+	seed := "seed"
+	capsuleDigest := strings.Repeat("a", 64)
+	capsule := domain.ReplayCapsule{
+		Digest: capsuleDigest, ObjectDigests: []string{strings.Repeat("b", 64)},
+		ReplayCommand: []string{"replay"}, Seed: seed, Comparator: "exact",
+	}
+	observation := domain.ObservationSpec{
+		ID: "observation", Inputs: []any{"fixture"}, Preconditions: []domain.HookRef{{BuiltIn: "always"}},
+		Comparator: domain.ComparatorSpec{BuiltIn: "exact"},
+	}
+	target := domain.VerificationTarget{ID: "target", Language: "go"}
+	first := domain.ObservedDivergence{
+		ID: "divergence", FixtureOrInput: "fixture", BeforeObservation: 1, AfterObservation: 2,
+		Stable: true, ReplayCount: 99, ReplayCapsuleDigest: capsuleDigest,
+	}
+	second := first
+	pack := &domain.EvidencePack{Approval: domain.ApprovalContext{Approved: true}, Provenance: domain.Provenance{EnvironmentDigest: "environment"}}
+	recorded, promoted, status, reason := validateIndependentReplay(
+		observation, target, seed, "contract", pack, first, []domain.ReplayCapsule{capsule},
+		packrpc.ProbeResult{Divergences: []domain.ObservedDivergence{second}, Capsules: []domain.ReplayCapsule{capsule}},
+	)
+	if promoted == nil || status != domain.StatusRan || reason != "" {
+		t.Fatalf("independent replay should promote: witness=%#v status=%s reason=%q", promoted, status, reason)
+	}
+	if !recorded.Stable || recorded.ReplayCount != 2 || recorded.EnvironmentDigest != "environment" {
+		t.Fatalf("core did not derive replay fields: %#v", recorded)
+	}
+}
+
+func TestIndependentReplayRecordsUnverifiableComparator(t *testing.T) {
+	capsuleDigest := strings.Repeat("a", 64)
+	capsule := domain.ReplayCapsule{
+		Digest: capsuleDigest, ObjectDigests: []string{strings.Repeat("b", 64)}, ReplayCommand: []string{"replay"}, Seed: "seed",
+	}
+	observation := domain.ObservationSpec{
+		ID: "observation", Inputs: []any{"fixture"}, Preconditions: []domain.HookRef{{BuiltIn: "always"}},
+		Comparator: domain.ComparatorSpec{Symbol: "helpers.Compare"},
+	}
+	divergence := domain.ObservedDivergence{
+		ID: "divergence", FixtureOrInput: "fixture", BeforeObservation: 1, AfterObservation: 2, ReplayCapsuleDigest: capsuleDigest,
+	}
+	_, promoted, status, reason := validateIndependentReplay(
+		observation, domain.VerificationTarget{ID: "target"}, "seed", "contract",
+		&domain.EvidencePack{Approval: domain.ApprovalContext{Approved: true}}, divergence, []domain.ReplayCapsule{capsule},
+		packrpc.ProbeResult{Divergences: []domain.ObservedDivergence{divergence}, Capsules: []domain.ReplayCapsule{capsule}},
+	)
+	if promoted != nil || status != domain.StatusInconclusive || !strings.Contains(reason, "repository comparator symbols") {
+		t.Fatalf("custom comparator failure must be recorded: witness=%#v status=%s reason=%q", promoted, status, reason)
+	}
+}
+
+func TestManagedCallsUsePostExecutionContexts(t *testing.T) {
+	repository, base, head := testRepository(t, "before\n", "after\n")
+	fmServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(response, `{"explanation":"reviewed","suspicion":"low"}`)
+	}))
+	defer fmServer.Close()
+	telemetryServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(response, `{"id":"remote-evidence"}`)
+	}))
+	defer telemetryServer.Close()
+	policy := config.DefaultPolicy()
+	policy.Budgets.Total = domain.Duration(time.Second)
+	policy.Commands = []domain.CommandSpec{{
+		ID: "tests", Category: domain.CategoryTestRegression, Command: []string{"test"}, Image: "image@sha256:abc",
+	}}
+	policy.Telemetry.Enabled = true
+	policy.Telemetry.OrgAdminOptIn = true
+	policy.Telemetry.Organization = "acme"
+	policy.Telemetry.Repository = "acme/repo"
+	policy.Telemetry.AllowedRepos = []string{"acme/repo"}
+	policyPath := filepath.Join(t.TempDir(), "policy.yaml")
+	if err := config.WriteYAML(policyPath, policy); err != nil {
+		t.Fatal(err)
+	}
+	result, err := (Planner{
+		Runner:          deadlineRunner{},
+		FMClient:        managed.FMClient{Endpoint: fmServer.URL, AllowInsecure: true},
+		TelemetryClient: managed.TelemetryClient{Endpoint: telemetryServer.URL, AllowInsecure: true},
+	}).Analyze(context.Background(), Request{
+		Repository: repository, Base: base, Head: head, Output: filepath.Join(t.TempDir(), "run"), PolicyPath: policyPath, CoreVersion: "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Pack.AdvisoryReview.Status != domain.StatusRan || result.Pack.Telemetry.Status != "uploaded" {
+		t.Fatalf("managed calls inherited the exhausted execution context: review=%#v telemetry=%#v", result.Pack.AdvisoryReview, result.Pack.Telemetry)
 	}
 }
 

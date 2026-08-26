@@ -6,7 +6,6 @@ import hashlib
 import json
 import pathlib
 import subprocess
-import symtable
 import sys
 import time
 from collections import defaultdict
@@ -77,18 +76,14 @@ def analyze(params: dict[str, Any]) -> dict[str, Any]:
         for item in params.get("changed_files", [])
         if item.get("language") == "python"
     }
-    sources: dict[str, str] = {}
     trees: dict[str, ast.Module] = {}
-    tables: dict[str, symtable.SymbolTable] = {}
     for file in list_files(repo, revision):
         if not file.endswith((".py", ".pyi")):
             continue
         try:
             source = show_file(repo, revision, file)
             tree = ast.parse(source, filename=file, type_comments=True)
-            sources[file] = source
             trees[file] = tree
-            tables[file] = symtable.symtable(source, file, "exec")
         except (OSError, UnicodeError, SyntaxError, subprocess.CalledProcessError):
             continue
     callers = collect_callers(trees, changed)
@@ -172,7 +167,6 @@ def analyze(params: dict[str, Any]) -> dict[str, Any]:
                         "rank": 0,
                     }
                 )
-        _ = tables.get(file)
     elapsed = int((time.monotonic() - started) * 1000)
     return {
         "targets": targets,

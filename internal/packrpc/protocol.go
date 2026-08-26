@@ -175,7 +175,13 @@ func (c *Client) call(enc *json.Encoder, dec *json.Decoder, method string, param
 	if len(response.Result) == 0 {
 		return errors.New("JSON-RPC response has no result")
 	}
-	return json.Unmarshal(response.Result, out)
+	return decodeJSON(response.Result, out)
+}
+
+func decodeJSON(data []byte, output any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	return decoder.Decode(output)
 }
 
 func withStderr(err error, stderr string) error {
@@ -227,7 +233,7 @@ func Serve(ctx context.Context, in io.Reader, out io.Writer, handler Handler) er
 		}
 		if request.Method == "cancel" {
 			var params CancelParams
-			if err := json.Unmarshal(request.Params, &params); err != nil {
+			if err := decodeJSON(request.Params, &params); err != nil {
 				if err := write(Response{JSONRPC: "2.0", ID: request.ID, Error: &RPCError{Code: -32602, Message: err.Error()}}); err != nil {
 					return err
 				}
@@ -277,7 +283,7 @@ func dispatch(ctx context.Context, handler Handler, request RawRequest) (any, *R
 	switch request.Method {
 	case "initialize":
 		var params InitializeParams
-		if err := json.Unmarshal(request.Params, &params); err != nil {
+		if err := decodeJSON(request.Params, &params); err != nil {
 			return nil, &RPCError{Code: -32602, Message: err.Error()}
 		}
 		capability := handler.Capability()
@@ -287,7 +293,7 @@ func dispatch(ctx context.Context, handler Handler, request RawRequest) (any, *R
 		return InitializeResult{Capability: capability}, nil
 	case "analyze":
 		var params AnalyzeParams
-		if err := json.Unmarshal(request.Params, &params); err != nil {
+		if err := decodeJSON(request.Params, &params); err != nil {
 			return nil, &RPCError{Code: -32602, Message: err.Error()}
 		}
 		deadlineCtx, cancel := budgetContext(ctx, params.BudgetMS)
@@ -299,7 +305,7 @@ func dispatch(ctx context.Context, handler Handler, request RawRequest) (any, *R
 		return result, nil
 	case "probe":
 		var params ProbeParams
-		if err := json.Unmarshal(request.Params, &params); err != nil {
+		if err := decodeJSON(request.Params, &params); err != nil {
 			return nil, &RPCError{Code: -32602, Message: err.Error()}
 		}
 		deadlineCtx, cancel := budgetContext(ctx, params.BudgetMS)

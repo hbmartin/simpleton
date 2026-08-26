@@ -109,13 +109,13 @@ func (r ContainerRunner) Run(ctx context.Context, repo string, policy domain.Exe
 	if err == nil {
 		return result, nil
 	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return result, ctxErr
+	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
 		result.ExitCode = exitErr.ExitCode()
 		return result, nil
-	}
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return result, context.DeadlineExceeded
 	}
 	return result, fmt.Errorf("run container: %w: %s", err, strings.TrimSpace(stderr.String()))
 }
