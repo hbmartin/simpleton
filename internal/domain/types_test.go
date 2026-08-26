@@ -56,12 +56,17 @@ func TestPolicyRejectsUnsafeBlockingAndBudget(t *testing.T) {
 	}
 }
 
-func TestBlockingPolicyRequiresExplicitAllowedCategory(t *testing.T) {
+func TestBlockingPolicyAllowsExplicitlyEmptyCategorySet(t *testing.T) {
 	policy := testPolicy()
 	policy.Mode = "blocking"
 	policy.Blocking.Allow = nil
-	if err := policy.Validate(); err == nil {
-		t.Fatal("blocking mode with no allowed categories must be rejected")
+	if err := policy.Validate(); err != nil {
+		t.Fatalf("schema-valid nonblocking configuration was rejected: %v", err)
+	}
+	if blockers := policy.SelectBlockers(EvidencePack{Witnesses: []BehavioralWitness{{
+		ID: "witness", ContractRelevanceStatus: "violated", ApprovedContractDigest: "contract",
+	}}}); len(blockers) != 0 {
+		t.Fatalf("empty allow list selected blockers: %#v", blockers)
 	}
 }
 

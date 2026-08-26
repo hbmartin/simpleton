@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -145,13 +146,57 @@ func TestIndependentReplayRecordsUnverifiableComparator(t *testing.T) {
 	}
 }
 
+func TestIndependentReplaySanitizesPackAssertedTrustFields(t *testing.T) {
+	observation := domain.ObservationSpec{ID: "observation"}
+	target := domain.VerificationTarget{ID: "target"}
+	reported := domain.ObservedDivergence{
+		Status: domain.ObservationDivergenceConfirmed, Stable: true, ReplayCount: 99,
+		EnvironmentDigest: "forged-environment", BaselineArtifactDigest: "forged-before",
+		CandidateArtifactDigest: "forged-after", ReplayCapsuleDigest: "forged-capsule",
+		PreconditionEvidence: []string{"forged"},
+	}
+	recorded, promoted, status, _ := validateIndependentReplay(
+		observation, target, "seed", "contract", &domain.EvidencePack{}, reported, nil, packrpc.ProbeResult{},
+	)
+	if promoted != nil || status != domain.StatusInconclusive {
+		t.Fatalf("invalid divergence was promoted: witness=%#v status=%s", promoted, status)
+	}
+	if recorded.Status != domain.ObservationNotObserved || recorded.Stable || recorded.ReplayCount != 0 ||
+		recorded.EnvironmentDigest != "" || recorded.BaselineArtifactDigest != "" || recorded.CandidateArtifactDigest != "" ||
+		recorded.ReplayCapsuleDigest != "" || len(recorded.PreconditionEvidence) != 0 {
+		t.Fatalf("pack-asserted trust fields survived sanitization: %#v", recorded)
+	}
+}
+
+func TestReplayCapsuleRequiresCoreIssuedSeed(t *testing.T) {
+	capsule := domain.ReplayCapsule{
+		Digest: strings.Repeat("a", 64), ObjectDigests: []string{strings.Repeat("b", 64)},
+		ReplayCommand: []string{"replay"}, Comparator: "exact",
+	}
+	if reason := validateReplayCapsule(capsule, "seed", "exact"); !strings.Contains(reason, "core-issued seed") {
+		t.Fatalf("missing seed was accepted: %q", reason)
+	}
+	capsule.Seed = "seed"
+	if reason := validateReplayCapsule(capsule, "seed", "exact"); reason != "" {
+		t.Fatalf("matching seed was rejected: %q", reason)
+	}
+	if reason := validateReplayCapsule(capsule, "different-seed", "exact"); !strings.Contains(reason, "does not match") {
+		t.Fatalf("wrong seed was accepted: %q", reason)
+	}
+}
+
 func TestManagedCallsUsePostExecutionContexts(t *testing.T) {
 	repository, base, head := testRepository(t, "before\n", "after\n")
+	output := filepath.Join(t.TempDir(), "run")
+	var localEvidencePresent atomic.Bool
 	fmServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(response, `{"explanation":"reviewed","suspicion":"low"}`)
 	}))
 	defer fmServer.Close()
 	telemetryServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		if _, err := os.Stat(filepath.Join(output, "evidence-pack.json")); err == nil {
+			localEvidencePresent.Store(true)
+		}
 		fmt.Fprint(response, `{"id":"remote-evidence"}`)
 	}))
 	defer telemetryServer.Close()
@@ -174,13 +219,16 @@ func TestManagedCallsUsePostExecutionContexts(t *testing.T) {
 		FMClient:        managed.FMClient{Endpoint: fmServer.URL, AllowInsecure: true},
 		TelemetryClient: managed.TelemetryClient{Endpoint: telemetryServer.URL, AllowInsecure: true},
 	}).Analyze(context.Background(), Request{
-		Repository: repository, Base: base, Head: head, Output: filepath.Join(t.TempDir(), "run"), PolicyPath: policyPath, CoreVersion: "test",
+		Repository: repository, Base: base, Head: head, Output: output, PolicyPath: policyPath, CoreVersion: "test",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.Pack.AdvisoryReview.Status != domain.StatusRan || result.Pack.Telemetry.Status != "uploaded" {
 		t.Fatalf("managed calls inherited the exhausted execution context: review=%#v telemetry=%#v", result.Pack.AdvisoryReview, result.Pack.Telemetry)
+	}
+	if !localEvidencePresent.Load() {
+		t.Fatal("telemetry upload happened before evidence was persisted locally")
 	}
 }
 

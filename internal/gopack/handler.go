@@ -1,20 +1,16 @@
 package gopack
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"go/ast"
 	"go/importer"
 	"go/parser"
 	"go/token"
 	"go/types"
-	"io"
-	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -167,90 +163,190 @@ func parseRepository(ctx context.Context, repo gitx.Repository, revision string,
 		}
 		parsed[path] = file
 	}
-	metadata := loadPackageMetadata(ctx, repo, revision)
-	declarationKeys, callers, diagnostics := typeCheck(fset, parsed, metadata)
+	metadata := loadPackageMetadata(ctx, repo, revision, paths)
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, nil, err
+	}
+	declarationKeys, callers, diagnostics, err := typeCheck(ctx, fset, parsed, metadata)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
 	return parsed, declarationKeys, callers, diagnostics, nil
 }
 
 type packageMetadata struct {
-	pathByDirectory map[string]string
-	exports         map[string]string
-	diagnostics     []string
+	modules     []moduleMetadata
+	diagnostics []string
 }
 
-type listedPackageError struct {
-	Err string `json:"Err"`
+type moduleMetadata struct {
+	root string
+	path string
 }
 
-type listedPackage struct {
-	ImportPath string               `json:"ImportPath"`
-	Dir        string               `json:"Dir"`
-	Export     string               `json:"Export"`
-	Error      *listedPackageError  `json:"Error"`
-	DepsErrors []listedPackageError `json:"DepsErrors"`
-}
-
-func loadPackageMetadata(ctx context.Context, repo gitx.Repository, revision string) packageMetadata {
-	metadata := packageMetadata{pathByDirectory: map[string]string{}, exports: map[string]string{}}
-	worktree, cleanup, err := repo.DetachedWorktree(ctx, revision)
-	if err != nil {
-		metadata.diagnostics = append(metadata.diagnostics, "prepare module-aware type analysis: "+err.Error())
-		return metadata
-	}
-	defer cleanup()
-	canonicalWorktree, err := filepath.EvalSymlinks(worktree)
-	if err != nil {
-		canonicalWorktree = worktree
-	}
-	cmd := exec.CommandContext(ctx, "go", "list", "-e", "-deps", "-export", "-json", "./...")
-	cmd.Dir = canonicalWorktree
-	cmd.Env = append(os.Environ(), "GOWORK=off", "GOPROXY=off")
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	output, runErr := cmd.Output()
-	decoder := json.NewDecoder(bytes.NewReader(output))
-	for {
-		var listed listedPackage
-		if err := decoder.Decode(&listed); err != nil {
-			if err != io.EOF {
-				metadata.diagnostics = append(metadata.diagnostics, "decode go list metadata: "+err.Error())
-			}
+func loadPackageMetadata(ctx context.Context, repo gitx.Repository, revision string, paths []string) packageMetadata {
+	metadata := packageMetadata{}
+	for _, path := range paths {
+		if err := ctx.Err(); err != nil {
+			metadata.diagnostics = append(metadata.diagnostics, err.Error())
 			break
 		}
-		if listed.ImportPath != "" && listed.Export != "" {
-			metadata.exports[listed.ImportPath] = listed.Export
+		if filepath.Base(path) != "go.mod" {
+			continue
 		}
-		if relative, err := filepath.Rel(canonicalWorktree, listed.Dir); listed.Dir != "" && err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-			metadata.pathByDirectory[filepath.ToSlash(relative)] = listed.ImportPath
+		contents, err := repo.FileAt(ctx, revision, path)
+		if err != nil {
+			metadata.diagnostics = append(metadata.diagnostics, "read "+path+": "+err.Error())
+			continue
 		}
-		if listed.Error != nil && listed.Error.Err != "" {
-			metadata.diagnostics = append(metadata.diagnostics, listed.ImportPath+": "+listed.Error.Err)
+		modulePath, err := parseModulePath(contents)
+		if err != nil {
+			metadata.diagnostics = append(metadata.diagnostics, path+": "+err.Error())
+			continue
 		}
-		for _, dependencyError := range listed.DepsErrors {
-			if dependencyError.Err != "" {
-				metadata.diagnostics = append(metadata.diagnostics, listed.ImportPath+": "+dependencyError.Err)
-			}
-		}
+		metadata.modules = append(metadata.modules, moduleMetadata{
+			root: filepath.ToSlash(filepath.Dir(path)),
+			path: modulePath,
+		})
 	}
-	if runErr != nil {
-		message := strings.TrimSpace(stderr.String())
-		if message == "" {
-			message = runErr.Error()
+	slices.SortFunc(metadata.modules, func(left, right moduleMetadata) int {
+		if len(left.root) != len(right.root) {
+			return len(right.root) - len(left.root)
 		}
-		metadata.diagnostics = append(metadata.diagnostics, "go list: "+message)
-	}
+		return strings.Compare(left.root, right.root)
+	})
 	slices.Sort(metadata.diagnostics)
 	metadata.diagnostics = slices.Compact(metadata.diagnostics)
 	return metadata
 }
 
-type parsedPackage struct {
-	paths []string
-	files []*ast.File
+func parseModulePath(contents []byte) (string, error) {
+	for _, rawLine := range strings.Split(string(contents), "\n") {
+		fields := strings.Fields(rawLine)
+		if len(fields) < 2 || fields[0] != "module" {
+			continue
+		}
+		path := fields[1]
+		if strings.HasPrefix(path, "\"") || strings.HasPrefix(path, "`") {
+			unquoted, err := strconv.Unquote(path)
+			if err != nil {
+				return "", fmt.Errorf("invalid quoted module path: %w", err)
+			}
+			path = unquoted
+		}
+		if path == "" {
+			return "", fmt.Errorf("module path is empty")
+		}
+		return path, nil
+	}
+	return "", fmt.Errorf("module directive is missing")
 }
 
-func typeCheck(fset *token.FileSet, parsed map[string]*ast.File, metadata packageMetadata) (map[*ast.FuncDecl]string, map[string][]caller, []string) {
-	packages := map[string]*parsedPackage{}
+func (m packageMetadata) packagePath(directory, fallback string) string {
+	directory = filepath.ToSlash(directory)
+	for _, module := range m.modules {
+		if module.root != "." && directory != module.root && !strings.HasPrefix(directory, module.root+"/") {
+			continue
+		}
+		relative := directory
+		if module.root != "." {
+			relative = strings.TrimPrefix(strings.TrimPrefix(directory, module.root), "/")
+		}
+		if relative == "." || relative == "" {
+			return module.path
+		}
+		return strings.TrimSuffix(module.path, "/") + "/" + relative
+	}
+	return fallback
+}
+
+type parsedPackage struct {
+	paths      []string
+	files      []*ast.File
+	info       *types.Info
+	types      *types.Package
+	checking   bool
+	checked    bool
+	checkError error
+}
+
+type repositoryImporter struct {
+	ctx         context.Context
+	fset        *token.FileSet
+	packages    map[string]*parsedPackage
+	fallback    types.Importer
+	diagnostics *[]string
+}
+
+type typeCheckResult struct {
+	declarationKeys map[*ast.FuncDecl]string
+	callers         map[string][]caller
+	diagnostics     []string
+	err             error
+}
+
+func (r *repositoryImporter) Import(path string) (*types.Package, error) {
+	if path == "unsafe" {
+		return types.Unsafe, nil
+	}
+	if group := r.packages[path]; group != nil {
+		return r.check(path, group)
+	}
+	return r.fallback.Import(path)
+}
+
+func (r *repositoryImporter) check(path string, group *parsedPackage) (*types.Package, error) {
+	if group.checked {
+		return group.types, group.checkError
+	}
+	if err := r.ctx.Err(); err != nil {
+		return nil, err
+	}
+	if group.checking {
+		return group.types, fmt.Errorf("import cycle involving %q", path)
+	}
+	group.checking = true
+	defer func() { group.checking = false }()
+	group.info = &types.Info{
+		Defs:       map[*ast.Ident]types.Object{},
+		Uses:       map[*ast.Ident]types.Object{},
+		Selections: map[*ast.SelectorExpr]*types.Selection{},
+	}
+	group.types = types.NewPackage(path, group.files[0].Name.Name)
+	configuration := types.Config{
+		Importer: r,
+		Error: func(err error) {
+			*r.diagnostics = append(*r.diagnostics, path+": "+err.Error())
+		},
+	}
+	group.checkError = types.NewChecker(&configuration, r.fset, group.types, group.info).Files(group.files)
+	group.checked = true
+	return group.types, group.checkError
+}
+
+func typeCheck(ctx context.Context, fset *token.FileSet, parsed map[string]*ast.File, metadata packageMetadata) (map[*ast.FuncDecl]string, map[string][]caller, []string, error) {
+	return typeCheckWithImporter(ctx, fset, parsed, metadata, importer.ForCompiler(fset, "source", nil))
+}
+
+func typeCheckWithImporter(ctx context.Context, fset *token.FileSet, parsed map[string]*ast.File, metadata packageMetadata, fallback types.Importer) (map[*ast.FuncDecl]string, map[string][]caller, []string, error) {
+	completed := make(chan typeCheckResult, 1)
+	go func() {
+		declarationKeys, callers, diagnostics, err := typeCheckSynchronously(ctx, fset, parsed, metadata, fallback)
+		completed <- typeCheckResult{declarationKeys: declarationKeys, callers: callers, diagnostics: diagnostics, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, nil, nil, ctx.Err()
+	case result := <-completed:
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, err
+		}
+		return result.declarationKeys, result.callers, result.diagnostics, result.err
+	}
+}
+
+func typeCheckSynchronously(ctx context.Context, fset *token.FileSet, parsed map[string]*ast.File, metadata packageMetadata, fallback types.Importer) (map[*ast.FuncDecl]string, map[string][]caller, []string, error) {
+	groups := map[string]*parsedPackage{}
 	paths := make([]string, 0, len(parsed))
 	for path := range parsed {
 		paths = append(paths, path)
@@ -260,10 +356,10 @@ func typeCheck(fset *token.FileSet, parsed map[string]*ast.File, metadata packag
 		file := parsed[path]
 		directory := filepath.Dir(path)
 		key := directory + ":" + file.Name.Name
-		group := packages[key]
+		group := groups[key]
 		if group == nil {
 			group = &parsedPackage{}
-			packages[key] = group
+			groups[key] = group
 		}
 		group.paths = append(group.paths, path)
 		group.files = append(group.files, file)
@@ -271,37 +367,65 @@ func typeCheck(fset *token.FileSet, parsed map[string]*ast.File, metadata packag
 	diagnostics := slices.Clone(metadata.diagnostics)
 	declarationKeys := map[*ast.FuncDecl]string{}
 	callers := map[string][]caller{}
-	packageKeys := make([]string, 0, len(packages))
-	for key := range packages {
-		packageKeys = append(packageKeys, key)
-	}
-	slices.Sort(packageKeys)
-	lookup := func(path string) (io.ReadCloser, error) {
-		export := metadata.exports[path]
-		if export == "" {
-			return nil, fmt.Errorf("module export data is unavailable for %q", path)
-		}
-		return os.Open(export)
-	}
-	for _, key := range packageKeys {
-		group := packages[key]
+	packages := map[string]*parsedPackage{}
+	packagePaths := make([]string, 0, len(groups))
+	for key, group := range groups {
 		directory := filepath.ToSlash(filepath.Dir(group.paths[0]))
-		packagePath := metadata.pathByDirectory[directory]
-		if packagePath == "" {
+		packagePath := metadata.packagePath(directory, key)
+		if packages[packagePath] != nil {
+			diagnostics = append(diagnostics, packagePath+": multiple packages resolve to the same import path")
 			packagePath = key
 		}
-		info := &types.Info{
-			Defs:       map[*ast.Ident]types.Object{},
-			Uses:       map[*ast.Ident]types.Object{},
-			Selections: map[*ast.SelectorExpr]*types.Selection{},
+		packages[packagePath] = group
+		packagePaths = append(packagePaths, packagePath)
+	}
+	slices.Sort(packagePaths)
+	checker := &repositoryImporter{
+		ctx: ctx, fset: fset, packages: packages,
+		fallback: fallback, diagnostics: &diagnostics,
+	}
+	for _, packagePath := range packagePaths {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, err
 		}
-		configuration := types.Config{
-			Importer: importer.ForCompiler(fset, "gc", lookup),
-			Error: func(err error) {
-				diagnostics = append(diagnostics, packagePath+": "+err.Error())
-			},
+		_, _ = checker.check(packagePath, packages[packagePath])
+	}
+	receiverTypes := make([]types.Type, 0)
+	for _, packagePath := range packagePaths {
+		group := packages[packagePath]
+		for _, name := range group.types.Scope().Names() {
+			typeName, ok := group.types.Scope().Lookup(name).(*types.TypeName)
+			if !ok {
+				continue
+			}
+			named, ok := typeName.Type().(*types.Named)
+			if !ok {
+				continue
+			}
+			if _, isInterface := named.Underlying().(*types.Interface); isInterface {
+				continue
+			}
+			receiverTypes = append(receiverTypes, named, types.NewPointer(named))
 		}
-		_, _ = configuration.Check(packagePath, fset, group.files, info)
+		for _, file := range group.files {
+			for _, declaration := range file.Decls {
+				fn, ok := declaration.(*ast.FuncDecl)
+				if !ok || fn.Body == nil {
+					continue
+				}
+				object, _ := group.info.Defs[fn.Name].(*types.Func)
+				key := functionKey(object)
+				if key != "" {
+					declarationKeys[fn] = key
+				}
+			}
+		}
+	}
+	for _, packagePath := range packagePaths {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, err
+		}
+		group := packages[packagePath]
 		for index, file := range group.files {
 			path := group.paths[index]
 			for _, declaration := range file.Decls {
@@ -309,25 +433,27 @@ func typeCheck(fset *token.FileSet, parsed map[string]*ast.File, metadata packag
 				if !ok || fn.Body == nil {
 					continue
 				}
-				object, _ := info.Defs[fn.Name].(*types.Func)
-				key := functionKey(object)
-				if key != "" {
-					declarationKeys[fn] = key
-				}
 				ast.Inspect(fn.Body, func(node ast.Node) bool {
+					if ctx.Err() != nil {
+						return false
+					}
 					call, ok := node.(*ast.CallExpr)
 					if !ok {
 						return true
 					}
-					called := calledFunction(info, call.Fun)
-					calledKey := functionKey(called)
-					if calledKey != "" {
-						callers[calledKey] = append(callers[calledKey], caller{Path: path, Symbol: declarationSymbol(fn)})
+					for _, called := range calledFunctions(group.info, call.Fun, receiverTypes) {
+						calledKey := functionKey(called)
+						if calledKey != "" {
+							callers[calledKey] = append(callers[calledKey], caller{Path: path, Symbol: declarationSymbol(fn)})
+						}
 					}
 					return true
 				})
 			}
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, err
 	}
 	slices.Sort(diagnostics)
 	diagnostics = slices.Compact(diagnostics)
@@ -342,7 +468,54 @@ func typeCheck(fset *token.FileSet, parsed map[string]*ast.File, metadata packag
 			return left.Path == right.Path && left.Symbol == right.Symbol
 		})
 	}
-	return declarationKeys, callers, diagnostics
+	return declarationKeys, callers, diagnostics, nil
+}
+
+func calledFunctions(info *types.Info, expression ast.Expr, receiverTypes []types.Type) []*types.Func {
+	called := calledFunction(info, expression)
+	functions := []*types.Func{}
+	seen := map[string]bool{}
+	appendFunction := func(function *types.Func) {
+		key := functionKey(function)
+		if key != "" && !seen[key] {
+			seen[key] = true
+			functions = append(functions, function)
+		}
+	}
+	appendFunction(called)
+	selection := calledSelection(info, expression)
+	if selection == nil || called == nil {
+		return functions
+	}
+	interfaceType, ok := selection.Recv().Underlying().(*types.Interface)
+	if !ok {
+		return functions
+	}
+	interfaceType.Complete()
+	for _, receiverType := range receiverTypes {
+		if !types.Implements(receiverType, interfaceType) {
+			continue
+		}
+		candidate, _, _ := types.LookupFieldOrMethod(receiverType, true, called.Pkg(), called.Name())
+		function, _ := candidate.(*types.Func)
+		appendFunction(function)
+	}
+	return functions
+}
+
+func calledSelection(info *types.Info, expression ast.Expr) *types.Selection {
+	switch expression := expression.(type) {
+	case *ast.SelectorExpr:
+		return info.Selections[expression]
+	case *ast.IndexExpr:
+		return calledSelection(info, expression.X)
+	case *ast.IndexListExpr:
+		return calledSelection(info, expression.X)
+	case *ast.ParenExpr:
+		return calledSelection(info, expression.X)
+	default:
+		return nil
+	}
 }
 
 func calledFunction(info *types.Info, expression ast.Expr) *types.Func {

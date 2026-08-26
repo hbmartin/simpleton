@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -41,5 +42,35 @@ func TestContainerDeadlineIsNotReportedAsCommandFailure(t *testing.T) {
 	}, "example@sha256:abc", []string{"test"})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("deadline must be returned directly, result=%#v err=%v", result, err)
+	}
+}
+
+func TestCompletedNonzeroExitWinsOverConcurrentContextExpiry(t *testing.T) {
+	runErr := exec.Command("/bin/sh", "-c", "exit 7").Run()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, err := classifyRunError(ctx, CommandResult{}, runErr, false, "failed")
+	if err != nil || result.ExitCode != 7 {
+		t.Fatalf("real exit was masked by concurrent cancellation: result=%#v err=%v", result, err)
+	}
+}
+
+func TestCompletedNonzeroExitWinsEvenWhenCancelKillRaces(t *testing.T) {
+	runErr := exec.Command("/bin/sh", "-c", "exit 7").Run()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, err := classifyRunError(ctx, CommandResult{}, runErr, true, "")
+	if err != nil || result.ExitCode != 7 {
+		t.Fatalf("real exit was masked by a successful but losing kill: result=%#v err=%v", result, err)
+	}
+}
+
+func TestCancellationThatSignalsProcessWinsOverSignaledExit(t *testing.T) {
+	runErr := exec.Command("/bin/sh", "-c", "kill -KILL $$").Run()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := classifyRunError(ctx, CommandResult{}, runErr, true, "")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("winning cancellation was not preserved: %v", err)
 	}
 }

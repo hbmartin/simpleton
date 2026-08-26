@@ -2,10 +2,17 @@ package gopack
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"go/types"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/haroldmartin/simpleton/internal/domain"
 	"github.com/haroldmartin/simpleton/internal/gitx"
@@ -95,6 +102,112 @@ func TestAnalyzeQualifiesReceiverMethodsAndResolvesCallers(t *testing.T) {
 	}
 }
 
+func TestAnalyzeResolvesInterfaceDispatchToConcreteMethod(t *testing.T) {
+	repo := t.TempDir()
+	git(t, repo, "init", "-q")
+	git(t, repo, "config", "user.email", "simpleton@example.invalid")
+	git(t, repo, "config", "user.name", "Simpleton Test")
+	write(t, filepath.Join(repo, "go.mod"), "module example.invalid/dispatch\n\ngo 1.24\n")
+	write(t, filepath.Join(repo, "method.go"), "package dispatch\n\ntype Runner interface { Run() }\ntype Task struct{}\nfunc (Task) Run() {}\n")
+	write(t, filepath.Join(repo, "caller.go"), "package dispatch\n\nfunc Public(value Runner) { value.Run() }\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-qm", "base")
+	base := git(t, repo, "rev-parse", "HEAD")
+	write(t, filepath.Join(repo, "method.go"), "package dispatch\n\ntype Runner interface { Run() }\ntype Task struct{}\nfunc (Task) Run() { _ = 1 }\n")
+	git(t, repo, "commit", "-qam", "candidate")
+	head := git(t, repo, "rev-parse", "HEAD")
+
+	result, err := (Handler{}).Analyze(context.Background(), packrpc.AnalyzeParams{
+		Repository: repo, BaseRevision: base, HeadRevision: head,
+		ChangedFiles: []gitx.ChangedFile{{Path: "method.go", Language: "go"}}, BudgetMS: 10_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range result.Targets {
+		if target.Symbol != "Task.Run" {
+			continue
+		}
+		for _, boundary := range target.ObservationCandidates {
+			if boundary.Kind == "unchanged_caller" && boundary.Symbol == "Public" {
+				return
+			}
+		}
+		t.Fatalf("interface-dispatched caller was not resolved: %#v", target.ObservationCandidates)
+	}
+	t.Fatalf("Task.Run target was not found: %#v", result.Targets)
+}
+
+func TestAnalyzeResolvesInterfaceDispatchToPromotedMethod(t *testing.T) {
+	repo := t.TempDir()
+	git(t, repo, "init", "-q")
+	git(t, repo, "config", "user.email", "simpleton@example.invalid")
+	git(t, repo, "config", "user.name", "Simpleton Test")
+	write(t, filepath.Join(repo, "go.mod"), "module example.invalid/promoted\n\ngo 1.24\n")
+	write(t, filepath.Join(repo, "method.go"), "package promoted\n\ntype Runner interface { Run(); Stop() }\ntype base struct{}\nfunc (base) Run() {}\ntype Task struct { base }\nfunc (Task) Stop() {}\n")
+	write(t, filepath.Join(repo, "caller.go"), "package promoted\n\nfunc Public(value Runner) { value.Run() }\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-qm", "base")
+	base := git(t, repo, "rev-parse", "HEAD")
+	write(t, filepath.Join(repo, "method.go"), "package promoted\n\ntype Runner interface { Run(); Stop() }\ntype base struct{}\nfunc (base) Run() { _ = 1 }\ntype Task struct { base }\nfunc (Task) Stop() {}\n")
+	git(t, repo, "commit", "-qam", "candidate")
+	head := git(t, repo, "rev-parse", "HEAD")
+
+	result, err := (Handler{}).Analyze(context.Background(), packrpc.AnalyzeParams{
+		Repository: repo, BaseRevision: base, HeadRevision: head,
+		ChangedFiles: []gitx.ChangedFile{{Path: "method.go", Language: "go"}}, BudgetMS: 10_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range result.Targets {
+		if target.Symbol != "base.Run" {
+			continue
+		}
+		for _, boundary := range target.ObservationCandidates {
+			if boundary.Kind == "unchanged_caller" && boundary.Symbol == "Public" {
+				return
+			}
+		}
+		t.Fatalf("promoted interface implementation lost its caller: %#v", target.ObservationCandidates)
+	}
+	t.Fatalf("base.Run target was not found: %#v", result.Targets)
+}
+
+func TestAnalyzeResolvesCallersAcrossRepositoryPackages(t *testing.T) {
+	repo := t.TempDir()
+	git(t, repo, "init", "-q")
+	git(t, repo, "config", "user.email", "simpleton@example.invalid")
+	git(t, repo, "config", "user.name", "Simpleton Test")
+	write(t, filepath.Join(repo, "go.mod"), "module example.invalid/localimport\n\ngo 1.24\n")
+	write(t, filepath.Join(repo, "dep", "value.go"), "package dep\n\nfunc Adjust(value int) int { return value }\n")
+	write(t, filepath.Join(repo, "caller.go"), "package localimport\n\nimport \"example.invalid/localimport/dep\"\n\nfunc Public(value int) int { return dep.Adjust(value) }\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-qm", "base")
+	base := git(t, repo, "rev-parse", "HEAD")
+	write(t, filepath.Join(repo, "dep", "value.go"), "package dep\n\nfunc Adjust(value int) int { return value + 1 }\n")
+	git(t, repo, "commit", "-qam", "candidate")
+	head := git(t, repo, "rev-parse", "HEAD")
+
+	result, err := (Handler{}).Analyze(context.Background(), packrpc.AnalyzeParams{
+		Repository: repo, BaseRevision: base, HeadRevision: head,
+		ChangedFiles: []gitx.ChangedFile{{Path: "dep/value.go", Language: "go"}}, BudgetMS: 10_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Targets) != 1 || result.Targets[0].Symbol != "Adjust" {
+		t.Fatalf("unexpected targets: %#v", result.Targets)
+	}
+	boundaries := result.Targets[0].ObservationCandidates
+	if len(boundaries) == 0 || boundaries[0].Kind != "unchanged_caller" || boundaries[0].Symbol != "Public" {
+		t.Fatalf("cross-package caller was not resolved: %#v", boundaries)
+	}
+	if result.Methods[1].Status != domain.StatusRan {
+		t.Fatalf("type analysis should run cleanly: %#v", result.Methods)
+	}
+}
+
 func TestAnalyzeSortsChangedFiles(t *testing.T) {
 	repo := t.TempDir()
 	git(t, repo, "init", "-q")
@@ -123,7 +236,7 @@ func TestAnalyzeSortsChangedFiles(t *testing.T) {
 	}
 }
 
-func TestModuleMetadataIncludesStandardLibraryExports(t *testing.T) {
+func TestModuleMetadataDerivesPackagePathsWithoutCompilingRepository(t *testing.T) {
 	repo := t.TempDir()
 	git(t, repo, "init", "-q")
 	git(t, repo, "config", "user.email", "simpleton@example.invalid")
@@ -137,13 +250,61 @@ func TestModuleMetadataIncludesStandardLibraryExports(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	metadata := loadPackageMetadata(context.Background(), repository, revision)
-	if metadata.exports["os"] == "" {
-		t.Fatalf("standard library export data is missing: %#v", metadata.diagnostics)
+	fakeBin := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "go-was-executed")
+	fakeGo := filepath.Join(fakeBin, "go")
+	if err := os.WriteFile(fakeGo, []byte("#!/bin/sh\n: > \"$SIMPLETON_GO_MARKER\"\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
 	}
-	if metadata.pathByDirectory["."] != "example.invalid/metadata" {
-		t.Fatalf("module package path is missing: %#v", metadata.pathByDirectory)
+	t.Setenv("SIMPLETON_GO_MARKER", marker)
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	metadata := loadPackageMetadata(context.Background(), repository, revision, []string{"go.mod", "main.go"})
+	if got := metadata.packagePath(".", "fallback"); got != "example.invalid/metadata" {
+		t.Fatalf("module package path is missing: got=%q diagnostics=%#v", got, metadata.diagnostics)
 	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("metadata discovery executed the candidate Go toolchain: %v", err)
+	}
+}
+
+type blockingImporter struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b blockingImporter) Import(path string) (*types.Package, error) {
+	select {
+	case b.started <- struct{}{}:
+	default:
+	}
+	<-b.release
+	return nil, fmt.Errorf("import %q was released", path)
+}
+
+func TestTypeCheckReturnsWhenFallbackImporterIgnoresCancellation(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "sample.go", "package sample\nimport _ \"blocked.invalid/dependency\"\nfunc Example() {}\n", parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	importer := blockingImporter{started: make(chan struct{}, 1), release: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	returned := make(chan error, 1)
+	go func() {
+		_, _, _, err := typeCheckWithImporter(ctx, fset, map[string]*ast.File{"sample.go": file}, packageMetadata{}, importer)
+		returned <- err
+	}()
+	<-importer.started
+	cancel()
+	select {
+	case err := <-returned:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("type checking returned the wrong cancellation error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("type checking did not return promptly after cancellation")
+	}
+	close(importer.release)
 }
 
 func git(t *testing.T, directory string, args ...string) string {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"sync/atomic"
 	"testing"
@@ -94,5 +95,47 @@ func TestDecodeJSONPreservesLargeNumbers(t *testing.T) {
 	number, ok := decoded.Value.(json.Number)
 	if !ok || string(number) != "9007199254740993" {
 		t.Fatalf("large JSON number lost precision: %#v", decoded.Value)
+	}
+}
+
+func TestResponseDecoderRejectsOversizedResponse(t *testing.T) {
+	response := []byte(`{"jsonrpc":"2.0","id":1,"result":{"value":"oversized"}}`)
+	decoder := responseDecoder(bytes.NewReader(response), int64(len(response)-2))
+	var decoded Response
+	if err := decoder.Decode(&decoded); err == nil {
+		t.Fatal("expected a response truncated at the output limit to fail decoding")
+	}
+}
+
+func TestCappedBufferConsumesButTruncatesInput(t *testing.T) {
+	buffer := cappedBuffer{limit: 4}
+	written, err := buffer.Write([]byte("abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if written != 6 {
+		t.Fatalf("writer must consume the full input: got %d", written)
+	}
+	if got := buffer.String(); got != "abcd" {
+		t.Fatalf("buffer exceeded its cap: %q", got)
+	}
+}
+
+func TestAnalyzeDiscardsResponseWhenPackProcessFails(t *testing.T) {
+	script := fmt.Sprintf(`
+read _
+printf '%%s\n' '{"jsonrpc":"2.0","id":1,"result":{"capability":{"language":"go","protocol_version":"%s"}}}'
+read _
+printf '%%s\n' '{"jsonrpc":"2.0","id":2,"result":{"targets":[{"id":"forged"}],"methods":[{"id":"forged","status":"ran","findings":[{"id":"forged","category":"build_regression","title":"forged","validated":true,"advisory":false}]}]}}'
+exit 9
+`, domain.ProtocolVersion)
+	capability, analyzed, err := (&Client{Command: []string{"/bin/sh", "-c", script}}).InitializeAndAnalyze(
+		context.Background(), "test", AnalyzeParams{},
+	)
+	if err == nil {
+		t.Fatal("expected failed pack process to return an error")
+	}
+	if capability.Language != "" || len(analyzed.Targets) != 0 || len(analyzed.Methods) != 0 {
+		t.Fatalf("failed pack output crossed the trust boundary: capability=%#v result=%#v", capability, analyzed)
 	}
 }

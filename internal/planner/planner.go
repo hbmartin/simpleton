@@ -23,6 +23,7 @@ import (
 	"github.com/haroldmartin/simpleton/internal/execution"
 	"github.com/haroldmartin/simpleton/internal/gitx"
 	"github.com/haroldmartin/simpleton/internal/managed"
+	"github.com/haroldmartin/simpleton/internal/numeric"
 	"github.com/haroldmartin/simpleton/internal/packrpc"
 	"github.com/haroldmartin/simpleton/internal/report"
 	"github.com/haroldmartin/simpleton/internal/sense"
@@ -79,6 +80,9 @@ func (p Planner) Analyze(ctx context.Context, request Request) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	hardCtx, hardCancel := context.WithTimeout(ctx, policy.Budgets.HardCeiling.Duration())
+	defer hardCancel()
+	ctx = hardCtx
 	repo, err := gitx.Open(request.Repository)
 	if err != nil {
 		return Result{}, err
@@ -246,13 +250,20 @@ func (p Planner) Analyze(ctx context.Context, request Request) (Result, error) {
 	}
 
 	pack.Blockers = policy.SelectBlockers(pack)
+	if err := report.WriteAll(output, pack); err != nil {
+		return Result{}, err
+	}
+	digest, err := state.SaveEvidence(ctx, pack)
+	if err != nil {
+		return Result{}, err
+	}
 	uploadCtx, uploadCancel := context.WithTimeout(ctx, managedTimeout(policy, "telemetry_upload", 15*time.Second))
 	pack.Telemetry = p.upload(uploadCtx, policy, pack)
 	uploadCancel()
 	if err := report.WriteAll(output, pack); err != nil {
 		return Result{}, err
 	}
-	digest, err := state.SaveEvidence(ctx, pack)
+	digest, err = state.SaveEvidence(ctx, pack)
 	if err != nil {
 		return Result{}, err
 	}
@@ -343,7 +354,7 @@ func (p Planner) runContractProbes(ctx context.Context, request Request, policy 
 			validation.Status = domain.StatusInconclusive
 			validation.Reason = "two successful independent probe runs are required"
 			pack.Methods = append(pack.Methods, validation)
-			pack.Divergences = append(pack.Divergences, first.Divergences...)
+			pack.Divergences = append(pack.Divergences, sanitizeReportedDivergences(first.Divergences, target, observation)...)
 			continue
 		}
 		anyRan = true
@@ -351,7 +362,7 @@ func (p Planner) runContractProbes(ctx context.Context, request Request, policy 
 			validation.Status = domain.StatusFlaky
 			validation.Reason = reason
 			pack.Methods = append(pack.Methods, validation)
-			pack.Divergences = append(pack.Divergences, first.Divergences...)
+			pack.Divergences = append(pack.Divergences, sanitizeReportedDivergences(first.Divergences, target, observation)...)
 			continue
 		}
 		pack.ReplayCapsules = append(pack.ReplayCapsules, first.Capsules...)
@@ -382,9 +393,7 @@ func (p Planner) runContractProbes(ctx context.Context, request Request, policy 
 }
 
 func validateIndependentReplay(observation domain.ObservationSpec, target domain.VerificationTarget, seed, contractDigest string, pack *domain.EvidencePack, first domain.ObservedDivergence, firstCapsules []domain.ReplayCapsule, secondResult packrpc.ProbeResult) (domain.ObservedDivergence, *domain.BehavioralWitness, domain.MethodStatus, string) {
-	recorded := first
-	recorded.TargetID = target.ID
-	recorded.ObservationSpecID = observation.ID
+	recorded := sanitizeReportedDivergence(first, target, observation)
 	if first.ID == "" {
 		return recorded, nil, domain.StatusInconclusive, "probe divergence has no stable ID"
 	}
@@ -468,6 +477,22 @@ func validateIndependentReplay(observation domain.ObservationSpec, target domain
 		return recorded, nil, domain.StatusInconclusive, "witness promotion rejected: " + err.Error()
 	}
 	return recorded, &validatedWitness, domain.StatusRan, ""
+}
+
+func sanitizeReportedDivergences(reported []domain.ObservedDivergence, target domain.VerificationTarget, observation domain.ObservationSpec) []domain.ObservedDivergence {
+	sanitized := make([]domain.ObservedDivergence, 0, len(reported))
+	for _, divergence := range reported {
+		sanitized = append(sanitized, sanitizeReportedDivergence(divergence, target, observation))
+	}
+	return sanitized
+}
+
+func sanitizeReportedDivergence(reported domain.ObservedDivergence, target domain.VerificationTarget, observation domain.ObservationSpec) domain.ObservedDivergence {
+	return domain.ObservedDivergence{
+		ID: reported.ID, TargetID: target.ID, ObservationSpecID: observation.ID,
+		Status: domain.ObservationNotObserved, FixtureOrInput: reported.FixtureOrInput,
+		BeforeObservation: reported.BeforeObservation, AfterObservation: reported.AfterObservation,
+	}
 }
 
 func divergenceByID(id string, divergences []domain.ObservedDivergence) (domain.ObservedDivergence, bool) {
@@ -560,8 +585,8 @@ func evaluateBuiltInPrecondition(name string, fixture any) (bool, string) {
 func numericFixture(value any) (*big.Rat, bool) {
 	switch value := value.(type) {
 	case json.Number:
-		number, ok := new(big.Rat).SetString(string(value))
-		return number, ok
+		number, err := numeric.ParseJSONNumber(value)
+		return number, err == nil
 	case float64:
 		if math.IsNaN(value) || math.IsInf(value, 0) {
 			return nil, false
@@ -625,7 +650,10 @@ func validateReplayCapsule(capsule domain.ReplayCapsule, seed, comparator string
 			return "Replay Capsule contains a non-SHA-256 object digest"
 		}
 	}
-	if capsule.Seed != "" && capsule.Seed != seed {
+	if capsule.Seed == "" {
+		return "Replay Capsule must include the core-issued seed"
+	}
+	if capsule.Seed != seed {
 		return "Replay Capsule seed does not match the core-issued seed"
 	}
 	if capsule.Comparator != comparator {

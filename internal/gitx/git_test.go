@@ -81,6 +81,91 @@ func TestWorktreeDigestHashesDanglingSymlinkTarget(t *testing.T) {
 	}
 }
 
+func TestWorktreeDigestFramesUntrackedContents(t *testing.T) {
+	first := repositoryWithUntrackedFiles(t, map[string][]byte{
+		"a": append(append([]byte("x"), []byte("b\x00regular\x00")...), 'y'),
+		"b": []byte("z"),
+	})
+	second := repositoryWithUntrackedFiles(t, map[string][]byte{
+		"a": []byte("x"),
+		"b": []byte("yb\x00regular\x00z"),
+	})
+	firstDigest, err := first.WorktreeDigest(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondDigest, err := second.WorktreeDigest(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstDigest == secondDigest {
+		t.Fatalf("distinct framed worktrees collided: %s", firstDigest)
+	}
+}
+
+func TestWorktreeDigestIncludesNestedRepositoryState(t *testing.T) {
+	path := t.TempDir()
+	gitCommand(t, path, "init", "-q")
+	gitCommand(t, path, "config", "user.email", "simpleton@example.invalid")
+	gitCommand(t, path, "config", "user.name", "Simpleton Test")
+	if err := os.WriteFile(filepath.Join(path, "tracked.txt"), []byte("tracked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, path, "add", "tracked.txt")
+	gitCommand(t, path, "commit", "-qm", "base")
+	nested := filepath.Join(path, "nested")
+	if err := os.Mkdir(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, nested, "init", "-q")
+	gitCommand(t, nested, "config", "user.email", "simpleton@example.invalid")
+	gitCommand(t, nested, "config", "user.name", "Simpleton Test")
+	nestedFile := filepath.Join(nested, "value.txt")
+	if err := os.WriteFile(nestedFile, []byte("one"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, nested, "add", "value.txt")
+	gitCommand(t, nested, "commit", "-qm", "nested")
+	repository, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := repository.WorktreeDigest(context.Background())
+	if err != nil {
+		t.Fatalf("nested repository aborted digesting: %v", err)
+	}
+	if err := os.WriteFile(nestedFile, []byte("two"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := repository.WorktreeDigest(context.Background())
+	if err != nil || first == second {
+		t.Fatalf("nested repository state did not affect digest: first=%s second=%s err=%v", first, second, err)
+	}
+}
+
+func repositoryWithUntrackedFiles(t *testing.T, files map[string][]byte) Repository {
+	t.Helper()
+	path := t.TempDir()
+	gitCommand(t, path, "init", "-q")
+	gitCommand(t, path, "config", "user.email", "simpleton@example.invalid")
+	gitCommand(t, path, "config", "user.name", "Simpleton Test")
+	if err := os.WriteFile(filepath.Join(path, "tracked.txt"), []byte("tracked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, path, "add", "tracked.txt")
+	gitCommand(t, path, "commit", "-qm", "base")
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(path, name), content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	repository, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return repository
+}
+
 func gitCommand(t *testing.T, directory string, arguments ...string) string {
 	t.Helper()
 	command := exec.Command("git", arguments...)

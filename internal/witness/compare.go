@@ -11,6 +11,7 @@ import (
 	"sort"
 
 	"github.com/haroldmartin/simpleton/internal/domain"
+	"github.com/haroldmartin/simpleton/internal/numeric"
 )
 
 // ObservationPair is one baseline/candidate execution of an Observation Spec.
@@ -179,8 +180,14 @@ func Promote(divergence domain.ObservedDivergence, approvedAtHead bool, contract
 }
 
 func equalWithTolerance(left, right any, tolerances *domain.Tolerances) (bool, error) {
-	leftNumber, leftIsNumber := number(left)
-	rightNumber, rightIsNumber := number(right)
+	leftNumber, leftIsNumber, err := number(left)
+	if err != nil {
+		return false, err
+	}
+	rightNumber, rightIsNumber, err := number(right)
+	if err != nil {
+		return false, err
+	}
 	if leftIsNumber || rightIsNumber {
 		if !leftIsNumber || !rightIsNumber {
 			return false, nil
@@ -245,37 +252,39 @@ func equalWithTolerance(left, right any, tolerances *domain.Tolerances) (bool, e
 	return reflect.DeepEqual(left, right), nil
 }
 
-func number(value any) (*big.Rat, bool) {
+func number(value any) (*big.Rat, bool, error) {
 	switch typed := value.(type) {
 	case float64:
-		return finiteRat(typed)
+		number, ok := finiteRat(typed)
+		return number, ok, nil
 	case float32:
-		return finiteRat(float64(typed))
+		number, ok := finiteRat(float64(typed))
+		return number, ok, nil
 	case int:
-		return new(big.Rat).SetInt64(int64(typed)), true
+		return new(big.Rat).SetInt64(int64(typed)), true, nil
 	case int8:
-		return new(big.Rat).SetInt64(int64(typed)), true
+		return new(big.Rat).SetInt64(int64(typed)), true, nil
 	case int16:
-		return new(big.Rat).SetInt64(int64(typed)), true
+		return new(big.Rat).SetInt64(int64(typed)), true, nil
 	case int32:
-		return new(big.Rat).SetInt64(int64(typed)), true
+		return new(big.Rat).SetInt64(int64(typed)), true, nil
 	case int64:
-		return new(big.Rat).SetInt64(typed), true
+		return new(big.Rat).SetInt64(typed), true, nil
 	case uint:
-		return new(big.Rat).SetInt(new(big.Int).SetUint64(uint64(typed))), true
+		return new(big.Rat).SetInt(new(big.Int).SetUint64(uint64(typed))), true, nil
 	case uint8:
-		return new(big.Rat).SetInt(new(big.Int).SetUint64(uint64(typed))), true
+		return new(big.Rat).SetInt(new(big.Int).SetUint64(uint64(typed))), true, nil
 	case uint16:
-		return new(big.Rat).SetInt(new(big.Int).SetUint64(uint64(typed))), true
+		return new(big.Rat).SetInt(new(big.Int).SetUint64(uint64(typed))), true, nil
 	case uint32:
-		return new(big.Rat).SetInt(new(big.Int).SetUint64(uint64(typed))), true
+		return new(big.Rat).SetInt(new(big.Int).SetUint64(uint64(typed))), true, nil
 	case uint64:
-		return new(big.Rat).SetInt(new(big.Int).SetUint64(typed)), true
+		return new(big.Rat).SetInt(new(big.Int).SetUint64(typed)), true, nil
 	case json.Number:
-		n, ok := new(big.Rat).SetString(string(typed))
-		return n, ok
+		n, err := numeric.ParseJSONNumber(typed)
+		return n, err == nil, err
 	default:
-		return nil, false
+		return nil, false, nil
 	}
 }
 

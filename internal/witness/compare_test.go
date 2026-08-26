@@ -2,6 +2,7 @@ package witness
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/haroldmartin/simpleton/internal/domain"
@@ -21,6 +22,13 @@ func TestExactComparisonPreservesLargeIntegerPrecision(t *testing.T) {
 	violated, _, err := Compare(domain.ComparatorSpec{BuiltIn: "exact"}, nil, before, after)
 	if err != nil || !violated {
 		t.Fatalf("distinct integers beyond float64 precision must differ: violated=%t err=%v", violated, err)
+	}
+}
+
+func TestExactComparisonRejectsResourceIntensiveJSONNumber(t *testing.T) {
+	_, _, err := Compare(domain.ComparatorSpec{BuiltIn: "exact"}, nil, json.Number("1e10001"), json.Number("0"))
+	if err == nil || !strings.Contains(err.Error(), "resource limits") {
+		t.Fatalf("resource-intensive number was not rejected explicitly: %v", err)
 	}
 }
 

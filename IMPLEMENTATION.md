@@ -135,7 +135,7 @@ Native analysis strategy:
 
 Repository commands run only for trusted branches. The rootless-container substrate uses pinned images, disables networking, removes secrets, mounts source read-only, supplies writable ephemeral work/cache directories, and records the runtime/image digest. Missing container support returns `unsupported` for executable methods.
 
-Replay Capsules are immutable content-addressed bundles containing fixtures, generated source, serialized state, environment manifest, baseline/candidate artifacts, seeds, comparator identity, and commands. A witness is emitted only after replay and mechanical contract validation. Two matching repetitions are a flakiness screen, not proof of stability; history is retained by target.
+Executable Replay Capsules are immutable content-addressed bundles containing fixtures, generated source, serialized state, environment manifest, baseline/candidate artifacts, a core-issued seed, comparator identity, and commands. Structural patch capsules may omit execution-only fields such as the seed because they are not replayed as witnesses. A witness is emitted only after replay and mechanical contract validation. Two matching repetitions are a flakiness screen, not proof of stability; history is retained by target.
 
 Cache identity includes the full baseline/candidate trees, dependency lockfiles, generated code, pack/core versions, contract, policy, toolchain and container image, environment/locale, comparator, seed, and budget.
 
