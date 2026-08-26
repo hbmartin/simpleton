@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://simpleton.dev/schemas/v1/evaluation.schema.json",
+  "title": "Simpleton Pilot Evaluation",
+  "oneOf": [
+    {
+      "type": "object", "additionalProperties": false,
+      "required": ["boundary_constructibility", "legal_input_confidence", "contract_relevance", "replay_stability", "infrastructure_effort", "reviewer_usefulness"],
+      "properties": {
+        "boundary_constructibility": {"type": "integer", "minimum": 1, "maximum": 5},
+        "legal_input_confidence": {"type": "integer", "minimum": 1, "maximum": 5},
+        "contract_relevance": {"type": "integer", "minimum": 1, "maximum": 5},
+        "replay_stability": {"type": "integer", "minimum": 1, "maximum": 5},
+        "infrastructure_effort": {"type": "integer", "minimum": 1, "maximum": 5},
+        "reviewer_usefulness": {"type": "integer", "minimum": 1, "maximum": 5}
+      }
+    },
+    {
+      "type": "object", "additionalProperties": false,
+      "required": ["targets", "native_validated_witnesses", "generated_validated_witnesses"],
+      "properties": {
+        "targets": {"type": "integer", "minimum": 1},
+        "native_validated_witnesses": {"type": "integer", "minimum": 0},
+        "generated_validated_witnesses": {"type": "integer", "minimum": 0}
+      }
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://simpleton.dev/schemas/v1/learn-outcome.schema.json",
+  "title": "Simpleton LEARN Outcome",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id", "recorded_at"],
+  "properties": {
+    "run_id": {"type": "string", "minLength": 1},
+    "reviewer_action": {"type": "string"},
+    "accepted": {"type": "boolean"},
+    "reverted": {"type": "boolean"},
+    "review_cycles": {"type": "integer", "minimum": 0},
+    "review_minutes": {"type": "integer", "minimum": 0},
+    "escaped_regression": {"type": "boolean"},
+    "recorded_at": {"type": "string", "format": "date-time"}
+  }
+}

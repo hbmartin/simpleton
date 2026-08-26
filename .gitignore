@@ -1,2 +1,11 @@
 .DS_Store
 .mcp.json
+.simpleton/runs/
+node_modules/
+dist/
+bin/
+coverage/
+*.db
+research/
+__pycache__/
+*.pyc

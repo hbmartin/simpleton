@@ -1,6 +1,6 @@
 # Findings — Verification of the `research/` Claims
 
-*Evidence record. Compiled 2026-08-04 by independent check of the claims in `research/` against primary sources (arXiv, vendor reports, product documentation). This document is the evidentiary basis for `PLAN.md`; where the two disagree, this document wins.*
+*Evidence record. Compiled 2026-08-04 and corrected 2026-08-26 by independent check of the claims in `research/` against primary sources (arXiv, vendor reports, product documentation). This document wins on factual claims; `PLAN.md` wins on product decisions.*
 
 **Method.** Every load-bearing number in the three `research/` documents was traced to a primary source and compared verbatim against the abstract or report text. Claims that could not be traced are listed in §5 rather than silently dropped. Competitive/product claims (§6) come from vendor documentation and are marked as such.
 
@@ -38,11 +38,15 @@ These post-date or were missed by the source documents and materially strengthen
 
 > This is the most important single finding of the review. Two methodologically unrelated approaches — differential fuzzing on function-level refactorings, and adversarial test strengthening on repository-level patches — independently converge on **~20% of semantic breaks escaping existing test suites**. That convergence is the strongest empirical foundation Simpleton has. It also supplies a working blueprint for the test-strengthening rung of the verification stack.
 
-**Foundation models as refactoring-correctness oracles.** ([2605.02096](https://arxiv.org/abs/2605.02096)) 226 real refactoring bugs collected over more than a decade from IntelliJ IDEA, Eclipse and NetBeans, spanning 47 refactoring types. Zero-shot detection accuracy: GPT-OSS-20B 80.5% (first run), GPT-5.4 93.8%; Gemini-3.1-Pro-Preview best overall, Gemma-4-31B best open-weight. Authors explicitly caution that metamorphic-testing robustness is *not* evidence against memorisation or contamination.
+**Foundation models as advisory refactoring reviewers.** ([2605.02096](https://arxiv.org/abs/2605.02096)) The headline dataset contains 226 known Java refactoring failures, but 185 are compilation failures and only 41 are behavioral changes. The reported aggregate “accuracy” is therefore dominated by failures a compiler already exposes and is closer to recall on positive bug instances than deployment precision on balanced diffs. GPT-5.4 detected 58.5% of the behavioral cases at deterministic temperature; 18 of 44 project-diff feasibility cases were `UNKNOWN`; SafeRefactor caught 221/226. The authors position models as lightweight triage aids and explicitly decline to rule out memorisation or contamination.
 
-**Agent PR rejection economics.** ([2606.13468](https://arxiv.org/abs/2606.13468)) **46.41%** of fixes proposed by Copilot, Devin, Cursor and Claude in the AIDev dataset are rejected. Qualitative study of 306 non-merged PRs yields 14 reasons in four categories: incorrect implementation, CI/test failure, agent unable to implement, and **low priority** — i.e. correct work nobody wanted. Related: reviewer engagement is the strongest correlate of integration and larger diffs merge less often ([2602.19441](https://arxiv.org/abs/2602.19441)); acceptance is dominated by task type, with documentation at 82.1% vs new features at 66.1% across 7,156 PRs ([2602.08915](https://arxiv.org/abs/2602.08915)).
+**SemaDiff — nearest technical prior art.** ([2607.13111](https://arxiv.org/abs/2607.13111)) SemaDiff identifies changed Java code and unchanged dependent callers, generates an additional dependent class when needed, and runs equivalent exercises against the pre- and post-change versions. On 183 refactoring commits it reported 75.95% overall accuracy, 100% precision for detected semantic-changing refactorings, and 58.89% recall. Generated dependent code supplied nearly all detected changes and was necessary when changed code had no usable original caller. This establishes unchanged callers and public observation boundaries—not changed functions alone—as the closest baseline for Simpleton.
 
-**METR RCT.** ([2507.09089](https://metr.org/blog/2025-07-10-early-2025-ai-experienced-os-dev-study/)) 16 experienced open-source developers, 246 tasks on mature repositories they averaged ~5 years of familiarity with: **19% slower** with AI tools available, while self-reporting a 20% speedup (and forecasting 24%). METR now labels the result historical.
+**Agent PR rejection economics.** ([2606.13468](https://arxiv.org/abs/2606.13468)) **46.41%** of fixes proposed by Copilot, Devin, Cursor and Claude in the AIDev dataset are rejected. Qualitative study of 306 non-merged PRs yields 14 reasons in four categories: incorrect implementation, CI/test failure, agent unable to implement, and **low priority** — i.e. correct work nobody wanted. Rejection is not synonymous with technical failure: a later analysis of more than 11,000 closed agentic PRs attributed 35.7% of rejected PRs to clear agent failures, with workflow constraints and unexplained outcomes accounting for much of the rest. Related: reviewer engagement is the strongest correlate of integration and larger diffs merge less often ([2602.19441](https://arxiv.org/abs/2602.19441)); acceptance is dominated by task type, with documentation at 82.1% vs new features at 66.1% across 7,156 PRs ([2602.08915](https://arxiv.org/abs/2602.08915)).
+
+**METR RCT.** ([2507.09089](https://metr.org/blog/2025-07-10-early-2025-ai-experienced-os-dev-study/)) 16 experienced open-source developers, 246 tasks on mature repositories they averaged ~5 years of familiarity with: **19% slower** with AI tools available, while self-reporting a 20% speedup (and forecasting 24%). METR now labels the result historical; its February 2026 follow-up could not produce a reliable newer estimate because of selection and measurement effects. The result motivates direct reviewer-outcome measurement but is not a timeless commercial premise.
+
+**Mutation labels require adjudication.** Mutation systems cheaply generate candidate faults, but equivalent mutants may remain observably identical to the baseline. PIT and Stryker document that there is no reliable general automatic filter. Mutants are useful curated fault injection only after non-equivalence is independently witnessed, and operator mutations cannot stand in for the state, lifecycle, serialization, dependency, or API errors agents introduce.
 
 **GitClear 2026 — updated and re-baselined.** ([The Maintainability Gap](https://www.gitclear.com/the_ai_code_quality_maintainability_gap)) 623M changes, 2023–2026. Block duplication +81% since 2023 (40.3 → 73.0 per million changed lines); commits containing a duplicated block up ~10× over two years; moved code 21% (2022) → 3.8% (YTD 2026); copy/paste 9.4% → 15.7%; **cross-file function calls −35%** (343 → 223 per thousand lines); legacy maintenance −74%; error-masking constructs +47%; two-week churn +15%.
 
@@ -68,23 +72,29 @@ Corroborating: RefAgent reaches median F1 79.15% at opportunity identification w
 
 The same paper also names the pattern: **RefactoringMirror**, a detect-and-reapply tactic that reapplies an LLM-identified refactoring using thoroughly tested refactoring engines. This is prior art for "codemod-first, LLM-second" and should be cited as such.
 
-### (b) Deterministic refactoring engines are not a complete oracle
+### (b) Neither deterministic engines nor FM judgments are complete evidence
 
 The original plan grants Tier 1 ("tool-safe refactorings") an oracle of "engine guarantees + tests." The 226-bug corpus in [2605.02096](https://arxiv.org/abs/2605.02096) — drawn from IntelliJ IDEA, Eclipse and NetBeans over a decade, across 47 refactoring types — shows that mature IDE refactoring engines introduce behavioural changes and compilation errors in production. "The IDE applied it" is evidence, not proof.
 
-> **Design consequence.** Tier 1 needs a real oracle, not an assumed one. The same paper supplies a cheap one: zero-shot foundation-model bug detection at 80.5–93.8% accuracy, with no infrastructure and no refactoring-specific rules. It belongs in the verification stack between "tests pass" and "differential fuzzing."
+> **Design consequence.** “The engine applied it” remains evidence rather than proof, but the foundation-model results do not supply a replacement oracle: compilation catches most corpus cases, SafeRefactor catches 221/226, and GPT-5.4 reaches only 58.5% on the behavioral subset. The model belongs only in an advisory routing or explanation branch and may never create a witness or gate a merge.
 
-### (c) Tangling is associated with compilability, not correctness
+### (c) Replay establishes divergence, not validity
+
+A repeatable input/output difference establishes that two artifacts produced different recorded observations in one environment. It does not establish that the input is legal or reachable, or that exception wording, iteration order, rounding, identity, timing, or another observation was contractually required to remain stable.
+
+> **Design consequence.** A reported Behavioral Witness requires replay, machine-checkable domain preconditions, and a violated approved comparator. Other repeatable differences remain Observed Divergences for review. Verification targets should prefer unchanged callers and public observation boundaries, following SemaDiff, because a changed function is often neither directly exercisable nor the correct semantic boundary.
+
+### (d) Tangling is associated with compilability, not correctness
 
 [2605.22526](https://arxiv.org/abs/2605.22526) is explicit: tangled refactorings are strongly associated with reduced compilability *"while exhibiting no significant association with functional correctness."*
 
 > **Design consequence.** The purity/tangling guard is justified by build-greenness and reviewability. It must not be sold as a correctness control. The 19.34% → 38.33% compilability figure is the honest headline.
 
-### (d) Structural anchoring effects are small
+### (e) Structural anchoring effects are small
 
 Verbatim but modest: +2.2pp Func@5, −1.6 interaction rounds, link-following rate 0.15–0.18 → 0.21–0.24, Pass@1 +3.4pp, at ~10% more input tokens. The paper's own framing is that anchoring works "less by making agents smarter and more by making their navigation disciplined and reproducible." `research/` describes this as "drastically improve," which overstates it. The reproducibility benefit (halved run-to-run variance) is the real value and is worth having; the capability benefit is marginal.
 
-### (e) GitClear is a poor automatic control input
+### (f) GitClear is a poor automatic control input
 
 Directionally consistent across reports and the largest longitudinal dataset available — but vendor-produced, correlational, and **re-baselined between editions**. The 2025 report frames moved lines as 24.1% (2020) → 9.5% (2024); the 2026 report frames them as 21% (2022) → 3.8% (2026). Duplication moves from "8-fold increase" to "+81% since 2023 / ~10× more commits containing a duplicated block."
 
@@ -129,15 +139,15 @@ Treat as unsourced until traced. None are load-bearing after the redesign, but t
 
 **Grit.io.** AST-based transformations combined with ML, generating pull requests that clean up code and migrate frameworks; deterministic output suited to CI/CD. ([overview](https://www.brouseai.com/ai/grit-io))
 
-**What is not occupied.** No product sells *"prove this diff is behaviour-preserving."* The research components exist — differential precondition checking, Mokav, EquiBench, REM2.0's annotation-free Rust equivalence proofs, SWE-ABS's test-strengthening pipeline, foundation-model oracles — but no one has integrated them into a gate that accepts an arbitrary diff and returns evidence.
+**The narrower opening.** SemaDiff is close technical prior art, and Sonar/Gitar, Qodo, CodeRabbit, and Moderne occupy parts of the broad “AI code verification” category. The less occupied wedge is operational, cross-language **semantic-regression evidence and replayable, domain-valid, contract-relevant witnesses** for changes that claim to preserve selected behavior. Simpleton should not claim novelty merely from applying the same input to two versions or market itself as proof of arbitrary equivalence.
 
 ---
 
 ## 7. Net implications for design
 
-1. **The verification stack is the defensible artifact.** Strongest evidence in the corpus (§2 convergence), no incumbent (§6), and valuable on diffs from any author — which matters more each quarter as the share of agent-written code rises.
+1. **Executable evidence is the defensible artifact.** The strongest evidence in the corpus is the independent convergence that existing tests miss semantic failures. The market is not empty, so differentiation must come from applicability reporting, approved observation contracts, valid witnesses, replay operations, and outcome history.
 2. **Detectors scope the model; they do not replace it** (§3a). This changes what the detection layer emits and how it is evaluated.
-3. **Every oracle is probabilistic, including the deterministic engines** (§3b). The ladder should be ordered by evidence strength and cost, with no rung treated as complete.
-4. **Review throughput is the binding constraint, not generation** (§2: 46.41% rejection, "low priority" as a named category, larger diffs merging less, METR's 19%). Evidence packaging is the economic premise, not a nice-to-have.
+3. **Use an applicability-driven graph, not an oracle ladder** (§3b–c). A compiler failure may be definitive while a replayed fuzz difference may be irrelevant; evidence methods are not globally monotonic.
+4. **Reviewer value is a hypothesis to measure, not an inherited headline** (§2). Rejection and historical productivity data motivate concrete evidence, but review time, review cycles, acceptance, reverts, and escaped regressions must be measured directly with partners.
 5. **Renting the transformation layer removes the main reason to choose Java.** The deterministic-engine ecosystem was the argument for Java; if transformations are not being applied, what matters is fuzz/property-testing infrastructure and volume of agent-authored code. Java remains the right *evaluation* corpus (SWE-Refactor, the 226-bug oracle corpus, RefactoringMiner all target it).
 6. **Public benchmarks should be refactoring-specific, not SWE-bench.** SWE-Refactor and CodeTaste both post-date most contamination and score with static checks plus tests — close to what the verification stack needs anyway.

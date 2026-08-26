@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://simpleton.dev/schemas/v1/pack-protocol.schema.json",
+  "title": "Simpleton Pack JSON-RPC Shapes",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol_version", "methods"],
+  "properties": {
+    "protocol_version": {"const": "1"},
+    "methods": {"const": ["initialize", "analyze", "probe", "cancel"]},
+    "framing": {"const": "newline-delimited-json"}
+  }
+}

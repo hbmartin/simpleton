@@ -1,0 +1,121 @@
+package execution
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/haroldmartin/simpleton/internal/domain"
+)
+
+type CommandResult struct {
+	ExitCode          int
+	Stdout            string
+	Stderr            string
+	Duration          time.Duration
+	Runtime           string
+	Image             string
+	UnsupportedReason string
+}
+
+type Runner interface {
+	Run(context.Context, string, domain.ExecutionPolicy, string, []string) (CommandResult, error)
+}
+
+type ContainerRunner struct {
+	Runtime string
+	Lookup  func(string) (string, error)
+}
+
+func (r ContainerRunner) ResolveRuntime(preferred string) (string, error) {
+	lookup := r.Lookup
+	if lookup == nil {
+		lookup = exec.LookPath
+	}
+	if preferred != "" && preferred != "auto" {
+		path, err := lookup(preferred)
+		if err != nil {
+			return "", fmt.Errorf("container runtime %q is unavailable: %w", preferred, err)
+		}
+		return path, nil
+	}
+	for _, candidate := range []string{"podman", "docker"} {
+		if path, err := lookup(candidate); err == nil {
+			return path, nil
+		}
+	}
+	return "", errors.New("no rootless container runtime found (podman or docker)")
+}
+
+func (r ContainerRunner) BuildArgs(repo, image string, command []string) ([]string, error) {
+	if image == "" {
+		return nil, errors.New("pinned container image is required")
+	}
+	if !strings.Contains(image, "@sha256:") {
+		return nil, errors.New("container image must be pinned by SHA-256 digest")
+	}
+	if len(command) == 0 {
+		return nil, errors.New("container command is required")
+	}
+	abs, err := filepath.Abs(repo)
+	if err != nil {
+		return nil, err
+	}
+	args := []string{
+		"run", "--rm", "--network", "none", "--read-only",
+		"--user", "65532:65532",
+		"--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+		"--pids-limit", "512", "--tmpfs", "/tmp:rw,noexec,nosuid,size=512m",
+		"--tmpfs", "/workspace-cache:rw,nosuid,size=1g",
+		"--env", "HOME=/tmp/simpleton-home",
+		"--env", "XDG_CACHE_HOME=/workspace-cache",
+		"--env", "LANG=C.UTF-8",
+		"--env", "TZ=UTC",
+		"--volume", abs + ":/workspace:ro",
+		"--workdir", "/workspace",
+		image,
+	}
+	return append(args, command...), nil
+}
+
+func (r ContainerRunner) Run(ctx context.Context, repo string, policy domain.ExecutionPolicy, image string, command []string) (CommandResult, error) {
+	if policy.TrustClass != "trusted_branch" || policy.Network != "disabled" || policy.Secrets != "none" {
+		return CommandResult{}, errors.New("execution policy violates the initial trust boundary")
+	}
+	runtimePath, err := r.ResolveRuntime(policy.Runtime)
+	if err != nil {
+		return CommandResult{UnsupportedReason: err.Error()}, nil
+	}
+	args, err := r.BuildArgs(repo, image, command)
+	if err != nil {
+		return CommandResult{}, err
+	}
+	started := time.Now()
+	cmd := exec.CommandContext(ctx, runtimePath, args...)
+	cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin"}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err = cmd.Run()
+	result := CommandResult{
+		Stdout: stdout.String(), Stderr: stderr.String(), Duration: time.Since(started),
+		Runtime: filepath.Base(runtimePath), Image: image,
+	}
+	if err == nil {
+		return result, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		result.ExitCode = exitErr.ExitCode()
+		return result, nil
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return result, context.DeadlineExceeded
+	}
+	return result, fmt.Errorf("run container: %w: %s", err, strings.TrimSpace(stderr.String()))
+}

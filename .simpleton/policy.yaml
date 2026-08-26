@@ -1,0 +1,32 @@
+schema_version: "1"
+mode: shadow
+budgets:
+  total: 30m
+  hard_ceiling: 60m
+  methods:
+    go_pack: 5m
+    typescript_pack: 5m
+    python_pack: 5m
+blocking:
+  allow:
+    - build_regression
+    - typecheck_regression
+    - test_regression
+    - static_security_regression
+    - behavioral_witness
+execution:
+  trust_class: trusted_branch
+  runtime: auto
+  image: ""
+  network: disabled
+  secrets: none
+commands: []
+packs: {}
+telemetry:
+  enabled: false
+  org_admin_opt_in: false
+  organization: ""
+  repository: ""
+  allowed_repositories: []
+  retention_days: 30
+  training_permitted: false
