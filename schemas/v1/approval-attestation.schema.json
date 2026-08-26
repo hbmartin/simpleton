@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://simpleton.dev/schemas/v1/approval-attestation.schema.json",
+  "title": "Simpleton Git-host Code-owner Attestation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "provider", "repository", "pull_request", "head", "required_owners", "approving_owners", "codeowners_checked"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "provider": {"enum": ["github", "gitlab"]},
+    "repository": {"type": "string", "minLength": 1},
+    "pull_request": {"type": "string", "minLength": 1},
+    "head": {"type": "string", "minLength": 1},
+    "required_owners": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "approving_owners": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "codeowners_checked": {"const": true}
+  }
+}

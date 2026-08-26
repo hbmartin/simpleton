@@ -1,291 +1,183 @@
-# Implementation — Architecture and Practical Approaches
+# Simpleton — Technical Design
 
-*Companion to `PLAN.md` (design) and `FINDINGS.md` (evidence). Written 2026-08-04. Scope: how to actually build SENSE, PROVE and LEARN across TypeScript, Python, Go and Swift.*
+*Authoritative implementation design. Revised 2026-08-26 to implement `PLAN.md`. Where this document and `PLAN.md` differ on product behavior, `PLAN.md` wins.*
 
----
+## 1. Repository shape
 
-## 1. What multi-language actually costs
-
-The naive read is that four languages means four times the work. It doesn't, and the way it doesn't is the single most important fact for the architecture:
-
-> **Per-language cost is roughly *inverse* to the rung's evidence strength.**
-
-The foundation-model oracle (rung 5) — the weakest evidence, judgment-only, no counterexample — is **free in every language**. Differential fuzzing (rung 7) — the strongest evidence, produces real counterexamples — is the most expensive to port and the hardest in Swift by a wide margin.
-
-Left unmanaged, multi-language support therefore exerts constant downward pressure toward weaker oracles. A system that quietly ran rung 5 everywhere and rung 7 nowhere would look like it had broad coverage while proving almost nothing. Two design commitments follow, and everything else in this document serves them:
-
-1. **Capability is declared, never assumed.** Every language pack publishes a manifest of which rungs it can run and under what conditions. A rung that cannot run returns `unsupported` with a reason — never silently skipped, never faked.
-2. **Every verdict carries its evidence profile.** The output is not "safe/unsafe" but *which rungs ran, at what budget, over what fraction of the changed units*. Eligibility rate is a first-class metric, reported per diff and tracked over time.
-
-There is one more structural fact worth stating up front: **Swift is the forcing function.** If you build TypeScript and Python first, you will bake in assumptions — dynamic module loading, sub-second builds, Linux sandboxing — that Swift violates on all three counts. Designing the capability contract so Swift works honestly at rungs 1–6 and is *openly degraded* at rung 7 produces an architecture that is correct for everything else too.
-
----
-
-## 2. Capability reality
-
-Concrete tooling per rung. This table is the substance of the design; the architecture is mostly a way of organising it.
-
-### Verification rungs
-
-| Rung | TypeScript | Python | Go | Swift |
-|---|---|---|---|---|
-| **1** Build / typecheck | `tsc --noEmit` — strong | `mypy` / `pyright` — **optional typing, partial oracle** | `go build`, `go vet` — strong | `swift build` — strong types, **slow** |
-| **2** Tests | vitest/jest → JUnit XML | `pytest --junitxml` | `go test -json` | swift-testing / `xcodebuild` → xcresult (**parsing friction**) |
-| **3** Structural diff | tree-sitter + query pack | tree-sitter + query pack | tree-sitter, or `go/ast` + `go/types` for precision | tree-sitter, or SwiftSyntax |
-| **4** Static-analysis delta | eslint / oxlint + semgrep → SARIF | ruff + semgrep → SARIF | staticcheck / vet + semgrep → SARIF | SwiftLint + semgrep → SARIF |
-| **5** FM oracle | **free** | **free** | **free** | **free** |
-| **6** Test strengthening | **Stryker** (native `--incremental`) + c8 → lcov | mutmut / cosmic-ray + coverage.py → lcov | Gremlins (*"smallish modules"*) + `go test -cover` | **Muter** (SwiftSyntax; documented iOS-scale use) + llvm-cov / xccov |
-| **7** Differential fuzz | fast-check; twins easy | **Hypothesis** (best-in-class shrinking) + atheris; **twins trivial** | **`go test -fuzz`** native + **gosentry** (LibAFL, struct-aware, Nautilus grammars) | FuzzCheck (**experimental**); twins hard, builds slow |
-
-Two observations. First, **all four languages have a working mutation tool** — better than expected, and it enables both rung 6 and the seeded-mutation eval harness (`PLAN.md` §5) everywhere. Second, **Go is the strongest rung-7 language available**, not Python: native coverage-guided fuzzing in the standard toolchain, plus Trail of Bits' 2026 `gosentry` fork that swaps in LibAFL, adds native struct fuzzing and grammar-based fuzzing, and emits campaign coverage in one command.
-
-### Semantic index
-
-| | SCIP indexer | LSP | Native |
-|---|---|---|---|
-| TypeScript | `scip-typescript` | tsserver | ts-morph |
-| Python | `scip-python` | pyright | `ast`, libcst |
-| Go | `scip-go` | gopls | **`go/ast` + `go/types`** — full type info in stdlib |
-| Swift | **none** | SourceKit-LSP | **IndexStoreDB** (LMDB, fed by `swift-frontend -index-store-path`) |
-
-SCIP is a language-agnostic protocol whose consumers "do not need language-specific knowledge" — exactly the property we want — but the indexer ecosystem has a **Swift-shaped hole**. Swift's equivalent is IndexStoreDB, queried directly or via SourceKit-LSP.
-
-### Detectors for SENSE
-
-| Signal | Tool |
-|---|---|
-| Duplication | **jscpd** — Rabin-Karp, 150+ languages, covers all four in one tool (PMD CPD covers 31) |
-| Dead code | knip (TS, module-graph, ~150 plugins) · vulture (Py) · `x/tools/cmd/deadcode` (Go, official) · **Periphery** (Swift) |
-| Complexity | lizard (multi-language) or per-language |
-| Policy | semgrep (one rule format, all four) |
-
-SENSE is almost entirely off-the-shelf, which is what `PLAN.md` §3.1 assumed. The work is composition and the evidence bundle, not detection.
-
----
-
-## 3. Architecture
-
-Four layers. Only layer 2 is per-language, and it is deliberately thin.
-
-```
-┌─ L0  CONTRACTS ──────────────────────────────────────────────────┐
-│  JSON schemas: ScopeBundle · ChangedUnit · RungResult ·          │
-│  Counterexample · Verdict · CapabilityManifest                   │
-│  Language-neutral. This is the actual product.                   │
-├─ L1  ENGINE ─────────────────────────────────────────────────────┤
-│  Ecosystem routing · capability negotiation · rung sequencing ·   │
-│  budgets · content-addressed cache · adjudication · audit pack ·  │
-│  eval harness. Language-neutral.                                  │
-├─ L2  LANGUAGE PACKS ─────────────────────────────────────────────┤
-│  ts/ · py/ · go/ · swift/                                        │
-│  Each: capability manifest + tool adapters + tree-sitter query    │
-│  pack + twin-driver template + eligibility screen.               │
-│  Data and small adapters — not forks.                            │
-├─ L3  EXECUTION SUBSTRATE ────────────────────────────────────────┤
-│  Sandbox + toolchain images. Linux microVM for TS/Py/Go;          │
-│  macOS runner + process isolation for Swift (see §6).            │
-└──────────────────────────────────────────────────────────────────┘
+```text
+cmd/simpleton/          Go CLI
+internal/               planner, domain, execution, storage, reports, managed clients
+packs/                   native TypeScript, Python, and Swift pack sources
+schemas/v1/              current public JSON schemas and protocol shapes
+docs/adr/                hard-to-reverse decisions
+CONTEXT.md               canonical domain language
 ```
 
-### The three contracts that matter
+The Go pack is compiled into the Simpleton executable and spawned as a separate `pack go` process. TypeScript, Python, and Swift packs remain native executables. All packs are operationally isolated from the core.
 
-**`ChangedUnit`** — the atom of verification. `{language, file, symbol, kind, pre_blob, post_blob, eligibility: {fuzzable, reason}}`. Extracting these from a diff is the main job of a language pack's tree-sitter query pack.
+## 2. Public command behavior
 
-**`Counterexample`** — `{unit, input, pre_output, post_output, replay_command}`. Must be independently replayable. §5 explains why this single requirement carries most of the architecture.
-
-**`Verdict`** — never a boolean. `{units_total, units_eligible, rungs: [{id, status: ran|unsupported|budget_exhausted, reason, budget, findings}], counterexamples: [...]}`. "No counterexample found at budget N" with N present, or it is not a verdict.
-
-### Normalising formats instead of building them
-
-Every cross-language format problem already has an answer. Use it rather than inventing one.
-
-- **SARIF** for static-analysis findings — every analyzer emits it; rung 4 is a set-difference over SARIF.
-- **LCOV** for coverage — `grcov` normalises `.profraw` / `.gcda` / lcov / JaCoCo; Go and coverage.py convert cleanly. Swift goes llvm-cov → lcov.
-- **JUnit XML** for test results — all four ecosystems emit it (Swift via xcresult conversion, the one lossy path).
-- **SCIP** for semantic facts where an indexer exists; LSP where it doesn't; tree-sitter as the floor.
-
----
-
-## 4. Five approaches to the analysis layer
-
-The real architectural choice is how to get structural and semantic facts across four languages. These are the genuine alternatives.
-
-### Approach A — Universal IR / common AST (the Semgrep model)
-
-Map every language into one abstract syntax tree; write each analysis once.
-
-**For:** analyses written once, truly language-agnostic, extensible by adding a front end.
-**Against:** lossy by construction — Semgrep is "loosely coupled with each language," which is precisely why it is confined to pattern matching. You lose the type information that makes rung 3 meaningful. Swift's optionals, protocol witnesses, ARC semantics and value/reference distinction do not survive the mapping. And it is a very large up-front build.
-**Verdict: reject.** The cost lands before any value, and the lossiness bites exactly where we need precision.
-
-### Approach B — Tree-sitter monoculture
-
-One parser, 306+ grammars including Swift, per-language query packs for the rest.
-
-**For:** single API, error-tolerant, fast, usable as a **library** (Semgrep is not), grammars already exist for all four, handles partial/broken code — which matters because we parse both sides of a diff.
-**Against:** CST not AST — no types, no cross-file resolution, cannot tell you the receiver type of `foo.bar()`. Grammar quality varies.
-**Verdict: adopt as the floor.** Necessary, not sufficient.
-
-### Approach C — Native toolchain shell-out behind a JSON contract
-
-Each pack shells out to the ecosystem's own tools; the engine only orchestrates and normalises.
-
-**For:** maximum fidelity; you inherit ecosystem quality for free and it improves without you; per-language code stays tiny; `go/types` and SwiftSyntax give you things no universal layer can.
-**Against:** N toolchains to install, version, pin and sandbox; heterogeneous failure modes; Swift build latency is a real tax on any loop that rebuilds.
-**Verdict: adopt for rungs 1, 2, 4, 6, 7.** This is where the leverage is.
-
-### Approach D — LSP as the universal semantic API
-
-Every ecosystem ships a language server that speaks one protocol: gopls, pyright, tsserver, SourceKit-LSP.
-
-**For:** one protocol, real semantics, no indexer to build, and it is the *only* uniform semantic option for Swift.
-**Against:** built for interactive editing — stateful, slow to warm, flaky under batch load, no stable bulk API. SourceKit-LSP needs a built project, which reintroduces Swift build cost.
-**Verdict: adopt as the middle tier, used sparingly and cached hard.** Never on the hot path.
-
-### Approach E — Capability-tiered hybrid **(recommended)**
-
-```
-tree-sitter  ─── always available, syntactic floor
-     ↓ escalate only when the rung needs semantics
-LSP / SCIP   ─── usually available, cached, cross-file resolution
-     ↓ escalate only when precision is decisive
-native tools ─── go/types, SwiftSyntax, ts-morph, libcst
+```text
+simpleton analyze \
+  --repo /workspace/repo \
+  --base <git-revision> \
+  --head <git-revision> \
+  --output .simpleton/runs/<run-id> \
+  [--intent .simpleton/intents/<id>.yaml] \
+  [--policy .simpleton/policy.yaml]
 ```
 
-Each language pack declares which tier it reaches for which capability. The engine plans the cheapest tier that satisfies the rung and records which tier actually ran, so a Swift verdict and a Go verdict are comparable *and* visibly different.
+The command resolves immutable baseline/candidate commits, loads policy and intent, verifies approval context, runs the graph, persists local state, renders reports, optionally uploads a redacted pack, and maps policy-selected evidence to its exit code:
 
-**The cost of E** is that the engine must express "this rung ran at tier 1 in Swift and tier 3 in Go" without collapsing the distinction — the reporting complexity is real and permanent. That is the price of honesty, and it is cheaper than either the universal-IR build or the pretence that all languages are equally covered.
+- `0`: analysis completed without a selected blocker;
+- `1`: repository policy selected at least one block-eligible result;
+- `2`: invalid invocation, configuration, schema, protocol, or internal execution failure.
 
----
+Exit code 2 is an infrastructure signal, not a semantic conclusion. Unsupported methods and ordinary per-method execution failures are recorded in the Evidence Pack and do not use exit code 2 once the run itself can complete.
 
-## 5. The rung-7 decision: synthesised harnesses over ported fuzzers
+If the intent is absent, the output includes `proposed-change-intent.yaml`; inferred semantic probes are advisory. If the intent exists but current-head code-owner approval is absent or stale, the contract is parsed and used for advisory analysis only.
 
-Rung 7 needs a **twin harness**: extract a changed function's before and after versions, build both, drive them with identical inputs, compare. Cost varies enormously.
+## 3. Contracts
 
-| | Twin construction | Difficulty |
-|---|---|---|
-| Python | import both under different `sys.path` entries | trivial |
-| TypeScript | two builds, or module aliasing | easy |
-| Go | two modules with distinct paths, or `replace` directives | moderate — package-level compilation is the friction |
-| Swift | two static libraries + driver executable, module namespacing, slow rebuilds | hard |
+### Change Intent
 
-The obvious plan — port a native fuzzing stack per language — costs the most exactly where it is hardest, and would leave Swift with nothing for a long time.
+```yaml
+schema_version: "1"
+id: stable-change-id
+rationale: Consolidate duplicate price calculation
+classification: behavior_preserving
+scope:
+  - package: pricing
+allowed_changes:
+  - allocation_count
+equivalence_contract:
+  api_mappings: []
+  observations: []
+```
 
-**The alternative: have the model synthesise the differential harness per diff, and let the engine merely run it in a sandbox and adjudicate the result.**
+`schema_version`, `id`, `rationale`, `classification`, `scope`, `allowed_changes`, and `equivalence_contract` are required. The manifest is retained under `.simpleton/intents/`. A changed contract requires fresh code-owner approval for the current PR head.
 
-The objection is immediate: the harness is now LLM-generated and unverified, which is the failure mode this whole system exists to guard against. The answer is an asymmetry that makes the objection dissolve:
+### Observation Spec
 
-> **You never need to trust the harness. You only need to trust the counterexample — and a counterexample validates itself by replay.**
->
-> - A **false** counterexample is trivially killed: re-run both versions on the claimed input under a fixed seed. If outputs match, discard.
-> - A **missed** counterexample is a coverage loss, not a safety loss — and it is already accounted for by reporting eligibility rate.
+An Observation Spec identifies a Verification Target, setup, inputs or generator, preconditions, calls/events, observables, normalizers, comparator, and tolerances. Executable hooks are either reviewed built-ins or repository symbol references. Inline scripts are rejected.
 
-The error mode of a bad harness is therefore *silence*, which the evidence profile already exposes, not *false assurance*, which would be fatal. This is the same logic as TestGen-LLM's assured-improvement filter: let an unreliable generator propose, and gate on a mechanical check.
+Built-in comparators initially cover exact values, structural JSON, order-insensitive collections, exception type with optional message matching, and absolute/relative floating tolerance. Symbol hooks run in the same isolated environment as the target.
 
-The evidence supports the generator being good enough:
+### Policy
 
-- **Cleverest** — LLM-generated, feedback-directed regression tests targeting a specific code change found **as many bugs in under 2 minutes as the state-of-the-art directed greybox fuzzer WAFLGo found in 24 hours**, across 72 commits to Mujs, Libxml2, Poppler, JerryScript, Z3, PHP, JQ and MicroPython. Seeding coverage-guided fuzzing with those tests **doubled** the bug count ([2501.11086](https://arxiv.org/abs/2501.11086)).
-- **HarnessLLM** — training models to write *harness code* (synthesising inputs and validating outputs, enabling invariant checks) beats input/output-pair generation on bug finding and strategy diversity ([2511.01104](https://arxiv.org/abs/2511.01104)).
-- **AutoHarness** — iterative harness synthesis from environment feedback, with a small model plus harness outperforming a much larger model alone ([2603.03329](https://arxiv.org/abs/2603.03329)).
+`.simpleton/policy.yaml` defaults to shadow mode. It declares total/hard budgets, per-method budgets, trusted container images and commands, block-eligible categories, managed upload consent, organization/repository identity, and language-pack commands.
 
-Cleverest matters most: it is *change-directed* — it takes the commit and the diff, which is precisely our input — and its 2-minutes-versus-24-hours result is the difference between a rung that fits in CI and one that does not.
+The core enforces block eligibility independently of policy: policy cannot promote advisory FM output, unvalidated divergence, unsupported/inconclusive work, flakiness, or budget exhaustion.
 
-**Resulting design.** Harness synthesis is the **primary, portable** rung-7 strategy. Native fuzzers are **accelerators where they exist**, not prerequisites:
+## 4. Evidence Pack
 
-- **Go** — synthesised harness seeds `go test -fuzz` (and gosentry/LibAFL where installed). Best of both.
-- **Python** — synthesised harness expressed as a Hypothesis property, inheriting its shrinking.
-- **TypeScript** — synthesised harness expressed as a fast-check property.
-- **Swift** — synthesised harness compiled as an SPM test target. **This is how Swift gets rung 7 at all**, without building a Swift fuzzing stack.
+The Evidence Pack is versioned JSON containing:
 
-Non-negotiable guards, because the generator is untrusted:
-1. The harness must **compile**.
-2. It must **pass on the pre-image** — a harness that fails before the change is measuring its own bug.
-3. Fixed seeds; every counterexample ships a `replay_command`.
-4. Automatic replay before any counterexample is reported.
-5. Harnesses are **cached and versioned** by unit — they are reusable assets, not per-run throwaways.
+- run identity, base/head tree digests, intent and policy digests;
+- environment and trust-class provenance;
+- Pack Capability and Run Applicability per language/target;
+- Verification Targets and selected Observation Boundaries;
+- per-method status, budget, duration, coverage, and findings;
+- Observed Divergences and validated Behavioral Witnesses;
+- Replay Capsule content digests and replay commands;
+- SENSE Scoping Pack summary;
+- advisory FM review;
+- telemetry/redaction outcome and LEARN outcome links.
 
----
+Per-method statuses are `ran`, `unsupported`, `inconclusive`, `budget_exhausted`, `flaky`, and `execution_failed`. Semantic observations are `divergence_confirmed`, `no_divergence_observed`, or `not_observed`. None maps to “safe.”
 
-## 6. Execution substrate, and the Swift problem
+## 5. Evidence planner
 
-Rungs 2, 6 and 7 execute code that an agent may have written. The 2026 consensus for untrusted execution is microVM isolation — Firecracker boots in ~125 ms with under 5 MiB overhead — with gVisor as the Kubernetes-native alternative.
+The planner builds a DAG from repository policy, pack handshakes, Run Applicability, available budgets, and contract state. Cheap deterministic checks are scheduled before expensive probes, but their position does not imply globally stronger or weaker evidence.
 
-**That story does not cover Swift.** Firecracker and gVisor are Linux. Server-side Swift on Linux is fine; anything touching Apple platform frameworks is not. Swift verification needs **macOS runners with process-level isolation** — weaker containment, scarcer and more expensive hardware, and no microVM boot-time trick.
+```text
+resolve revisions and approval
+          │
+          ▼
+build · typecheck · tests · structural/static delta
+          │
+          ▼
+targets → stable callers/public boundaries
+          │
+    ┌─────┼─────────┐
+    ▼     ▼         ▼
+ stable  native   generated dependent
+ caller  probes   callers/harnesses
+    └─────┼─────────┘
+          ▼
+strengthening · mutation · adversarial · long fuzzing
+          │
+          ▼
+replay → precondition → comparator → minimization
+```
 
-This is not a detail to discover later. It means:
+All applicable nodes run in the online CI job within a 30-minute default and 60-minute hard ceiling. Context cancellation propagates over JSON-RPC and terminates pack processes. An exhausted node produces `budget_exhausted`; the graph continues where dependencies permit.
 
-- The substrate is **pluggable per ecosystem**, decided by the language pack's manifest, not global.
-- Swift's isolation tier is **recorded in the verdict** alongside its rung coverage — a Swift verdict is produced under materially different containment from a Go one, and pretending otherwise is the kind of quiet dishonesty this design exists to prevent.
-- Swift build latency compounds the problem. Mitigations: restrict to SPM targets rather than `xcodebuild` wherever possible, warm module caches, persist derived data across runs, and cache aggressively by content hash.
+## 6. Language-pack protocol
 
----
+Packs speak newline-framed JSON-RPC 2.0 over stdin/stdout. Required methods are:
 
-## 7. Cross-cutting mechanics
+- `initialize`: negotiate the exact protocol version and return Pack Capability;
+- `analyze`: extract targets, caller/public-boundary candidates, effect risks, and opportunities;
+- `probe`: execute a selected native or generated Probe;
+- `cancel`: cooperatively stop a request before process termination.
 
-**Ecosystem routing.** Detect by manifest — `package.json`/`tsconfig.json`, `pyproject.toml`/`setup.py`, `go.mod`, `Package.swift`/`*.xcodeproj`. Map each changed file to an ecosystem; a diff spanning several runs several packs and merges verdicts. Polyglot monorepos are the normal case, not the exception.
+The core rejects any version other than the current version. Requests include repository path, immutable revisions, changed files, contract digest, environment digest, seed, and budget. Responses never contain an aggregate verdict.
 
-**Eligibility screening.** Rung 7 cannot touch code that does I/O or is nondeterministic. Two-stage: a static screen per language (no `io`/`net`/`time`/`random` imports, no global writes, no unsafe), then runtime confirmation — run twice on identical input and compare, with the sandbox trapping syscalls. **Report the eligibility rate.** It is the direct empirical answer to `PLAN.md` §9 Q1, and the number most likely to determine whether this product is viable.
+Native analysis strategy:
 
-**Caching.** Content-address everything by `(rung, adapter version, pre_blob, post_blob, config hash)`. Rungs 6 and 7 are expensive enough that the cache is load-bearing, not an optimisation. Stryker's `--incremental` mode is the precedent worth copying: track changes and re-mutate only what moved, which brings per-PR mutation testing into the 1–5 minute range.
+- **Go:** `go/parser`, `go/types`, package loading, SSA/call-graph facts where available, global-write and effectful-call screening.
+- **TypeScript:** TypeScript compiler program/type checker, symbol references, import graph, async/global/effectful call screening.
+- **Python:** `ast`, `symtable`, import graph, optional type facts, decorator/async/global/nonlocal and effectful-call screening. Dynamic uncertainty becomes Run Applicability evidence.
+- **Swift:** SourceKit/SwiftSyntax-family parsing and index facts; Linux first. Apple targets require the macOS VM trust class.
 
-**Budgets.** Per-rung wall-clock and token ceilings, recorded in the verdict. A rung that exhausts its budget returns `budget_exhausted`, which is a different verdict from `unsupported` and from `ran`.
+## 7. Execution and replay
 
-**Flakiness.** The practical killer of any CI gate. Every execution rung runs twice on identical inputs before a failure is reported; disagreement is classified as flaky, not as a finding.
+Repository commands run only for trusted branches. The rootless-container substrate uses pinned images, disables networking, removes secrets, mounts source read-only, supplies writable ephemeral work/cache directories, and records the runtime/image digest. Missing container support returns `unsupported` for executable methods.
 
----
+Replay Capsules are immutable content-addressed bundles containing fixtures, generated source, serialized state, environment manifest, baseline/candidate artifacts, seeds, comparator identity, and commands. A witness is emitted only after replay and mechanical contract validation. Two matching repetitions are a flakiness screen, not proof of stability; history is retained by target.
 
-## 8. Build order
+Cache identity includes the full baseline/candidate trees, dependency lockfiles, generated code, pack/core versions, contract, policy, toolchain and container image, environment/locale, comparator, seed, and budget.
 
-This revises `PLAN.md` §6 in one respect: **Go, not Python, is the first language pack.**
+## 8. Local and managed data
 
-`PLAN.md` step 1 exists to answer "can rung 7 produce counterexamples on real code, and at what coverage?" Go answers that question faster and more cheaply than anything else available — native coverage-guided fuzzing, full type information in the standard library, fast hermetic builds, clean Linux sandboxing. Using it first is a change of language but not of intent.
+SQLite stores run metadata, method results, SENSE opportunities, reviewer actions, acceptance, reverts, and escaped regressions. Large artifacts live under a SHA-256 content store. Standalone Evidence Packs reference but do not depend on the database.
 
-1. **L0 contracts + L1 engine + capability manifest.** Language-neutral. No verification yet.
-2. **Go pack, rungs 1–3 + 7.** Native fuzzing proves the hardest rung end-to-end at minimum cost. Deliverable: eligibility rate and counterexample yield on a real Go repository.
-3. **Seeded-mutation eval harness** (Gremlins), concurrently — step 2 is unmeasurable without it.
-4. **Python pack.** Hypothesis for shrinking, trivial twin construction, and the largest volume of agent-written code. Validates that the contracts survive a second, quite different ecosystem.
-5. **Harness synthesis (§5) as the portable rung-7 path**, validated against Go's native fuzzing — where you have ground truth from step 2 to measure it against.
-6. **TypeScript pack.** Stryker's incremental mode makes rung 6 strongest here.
-7. **Swift pack, deliberately partial.** Rungs 1–6 plus synthesised property probes; macOS substrate; rung 7 openly degraded. Swift is the test of whether honest degradation actually works, so it must be attempted early enough to invalidate the design if it doesn't — but not before the contracts have survived two other ecosystems.
-8. **SENSE** across all packs, off-the-shelf detectors only, evaluated by scoping lift.
+The host process—not an execution container—may call the Simpleton-managed advisory model and telemetry service. Model output is untrusted text with no tools and is always advisory.
 
-**Validate the FM oracle per language.** The 93.8% figure comes from a Java-only corpus of IDE refactoring bugs, and its authors explicitly decline to rule out contamination. Because rung 5 is the one rung that is free everywhere, it is also the one most likely to be over-trusted. Measure it separately in each language against seeded mutations before granting it any weight.
+Managed upload requires all of:
 
----
+1. organization-admin opt-in;
+2. an allowlisted repository;
+3. successful local secret/sensitive-data redaction; and
+4. authenticated encrypted transport.
 
-## 9. Open questions
+The managed copy is the redacted Evidence Pack. Retention is 30 days for raw packs; deletion is supported; training and cross-customer use are prohibited without separate consent. Upload/model failure does not change local evidence or blocking.
 
-1. **What is rung-7 eligibility on real code?** Inherited from `PLAN.md` §9 Q1 and still the biggest unknown. Now sharper: measure it *per language*, since Python's dynamism, Go's explicit effects, TypeScript's async and Swift's ARC will give four different answers.
-2. **Does harness synthesis match native fuzzing where both exist?** Step 5 of the build order is designed to answer this against Go ground truth. If it does not, Swift's rung 7 is not merely degraded but absent, and the four-language promise weakens.
-3. **Does the FM oracle generalise beyond Java?** See §8.
-4. **Is tree-sitter enough for rung 3?** The three judgments actually needed — structural vs functional vs tangled, changed-unit extraction, and did-the-declared-transformation-occur — look achievable on CST plus query packs. This is an assumption, not a result. Note that RefactoringMiner is "migrating to a multi-language support infrastructure," which may make part of this moot.
-5. **Swift on macOS runners — cost and containment.** Weaker isolation and scarcer hardware may make Swift economically unattractive even where it is technically supported.
-6. **Does `go/types`-grade precision beat tree-sitter enough to justify tier escalation?** Go is the cheapest place to run this experiment, and the answer generalises to how much LSP/SCIP work the other packs deserve.
+## 9. SENSE and LEARN
 
----
+Each native pack returns detector opportunities with benefit, verifiability, risk, review effort, category, region, evidence, and allowed files. The core ranks opportunities by:
 
-## 10. Sources
+```text
+rank = normalized_benefit * applicability_confidence
+       / (1 + normalized_risk + normalized_review_effort)
+```
 
-Tooling and ecosystem claims in §2, §5 and §6 rest on:
-[gosentry / Go fuzzing](https://blog.trailofbits.com/2026/05/12/go-fuzzing-was-missing-half-the-toolkit.-we-forked-the-toolchain-to-fix-it./) ·
-[Gremlins](https://gremlins.dev/0.2/) ·
-[Muter](https://github.com/muter-mutation-testing/muter) ·
-[Scaling mutation testing in a large iOS codebase](https://ericsspace.com/articles/scaling-mutation-testing-in-a-large-ios-codebase/) ·
-[FuzzCheck](https://github.com/loiclec/FuzzCheck) ·
-[swift-testing](https://github.com/swiftlang/swift-testing) ·
-[IndexStoreDB](https://github.com/swiftlang/indexstore-db) ·
-[SourceKit-LSP semantic indexing](https://deepwiki.com/swiftlang/sourcekit-lsp/6-lsp-implementation) ·
-[Periphery](https://github.com/peripheryapp/periphery) ·
-[Stryker incremental mode](https://stryker-mutator.io/docs/stryker-js/incremental/) ·
-[knip](https://recca0120.github.io/en/2026/05/02/knip-dead-code-detector/) ·
-[cosmic-ray](https://github.com/sixty-north/cosmic-ray) ·
-[SCIP](https://scip-code.org/) ·
-[ast-grep vs Semgrep comparison](https://ast-grep.github.io/advanced/tool-comparison.html) ·
-[tree-sitter parser list](https://github.com/tree-sitter/tree-sitter/wiki/List-of-parsers) ·
-[jscpd](https://github.com/kucherenko/jscpd) ·
-[grcov](https://github.com/mozilla/grcov) ·
-[MicroVM isolation in 2026](https://emirb.github.io/blog/microvm-2026/) ·
-[RefactoringMiner](https://github.com/tsantalis/RefactoringMiner) ·
-[SemanticDiff](https://semanticdiff.com/)
+SENSE emits `scoping-pack.json`, `backlog.md`, and `backlog.html`. It has no mutation or dispatch authority.
 
-Research claims in §5: [2501.11086](https://arxiv.org/abs/2501.11086) · [2511.01104](https://arxiv.org/abs/2511.01104) · [2603.03329](https://arxiv.org/abs/2603.03329).
+LEARN provides local outcome ingestion and persists run-to-review links. Generic code-health trends remain out of scope; the stored outcome model is limited to evaluation and product efficacy.
+
+## 10. Generated-harness promotion
+
+Generated callers and harnesses are experimental candidates until evaluated per language/change class on at least 30 eligible targets. Promotion requires a one-sided 95% non-inferiority analysis whose interval excludes a validated-witness-yield loss greater than 20 percentage points relative to the native reference. Every reported witness must still have valid preconditions and stable replay; compile failures and invalid inputs count against yield.
+
+## 11. Delivery phases
+
+1. Contracts, schemas, Go core, storage, reports, and protocol fixtures.
+2. Pilot tooling and native Go/TypeScript/Python analysis packs.
+3. Rootless command execution, replay, contract validation, managed clients, and shadow CI.
+4. SENSE backlog and LEARN outcome ingestion.
+5. Partner policy blocking and Git-host approval adapters.
+6. Linux Swift pack, followed by ephemeral-macOS-VM Apple support.
+
+The current repository implements the executable foundation and conservative abstention paths. Research pilots and partner rollout require external repositories and human labels, so their manifests and results are data produced after the tooling exists rather than fabricated fixtures.

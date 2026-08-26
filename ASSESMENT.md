@@ -1,5 +1,7 @@
 # Overall assessment
 
+> **Status: incorporated historical review (2026-08-26).** Its corrections and trade-offs have been resolved into `FINDINGS.md`, `PLAN.md`, `IMPLEMENTATION.md`, `CONTEXT.md`, and the ADRs. It is retained as decision history and is not an authoritative specification.
+
 **Proceed with the core idea, but fund an experiment—not the full roadmap.**
 
 The three documents form a coherent and unusually self-critical proposal:

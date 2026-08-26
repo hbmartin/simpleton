@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://simpleton.dev/schemas/v1/policy.schema.json",
+  "title": "Simpleton Repository Policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "mode", "budgets", "blocking", "execution", "telemetry"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "mode": {"enum": ["shadow", "blocking"]},
+    "budgets": {
+      "type": "object", "additionalProperties": false, "required": ["total", "hard_ceiling"],
+      "properties": {
+        "total": {"type": "string"}, "hard_ceiling": {"type": "string"},
+        "methods": {"type": "object", "additionalProperties": {"type": "string"}}
+      }
+    },
+    "blocking": {
+      "type": "object", "additionalProperties": false, "required": ["allow"],
+      "properties": {"allow": {"type": "array", "items": {"enum": ["build_regression", "typecheck_regression", "test_regression", "static_security_regression", "behavioral_witness"]}}}
+    },
+    "execution": {
+      "type": "object", "additionalProperties": false, "required": ["trust_class", "network", "secrets"],
+      "properties": {
+        "trust_class": {"const": "trusted_branch"}, "runtime": {"type": "string"}, "image": {"type": "string"},
+        "network": {"const": "disabled"}, "secrets": {"const": "none"}
+      }
+    },
+    "commands": {"type": "array", "items": {
+      "type": "object", "additionalProperties": false, "required": ["id", "category", "command"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "category": {"enum": ["build_regression", "typecheck_regression", "test_regression", "static_security_regression"]},
+        "language": {"type": "string"}, "command": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "image": {"type": "string"}, "confidence": {"enum": ["high"]}
+      }
+    }},
+    "packs": {"type": "object", "additionalProperties": {
+      "type": "object", "additionalProperties": false, "required": ["command"],
+      "properties": {"command": {"type": "array", "minItems": 1, "items": {"type": "string"}}}
+    }},
+    "telemetry": {
+      "type": "object", "additionalProperties": false, "required": ["enabled", "org_admin_opt_in", "retention_days", "training_permitted"],
+      "properties": {
+        "enabled": {"type": "boolean"}, "org_admin_opt_in": {"type": "boolean"},
+        "organization": {"type": "string"}, "repository": {"type": "string"},
+        "allowed_repositories": {"type": "array", "items": {"type": "string"}},
+        "retention_days": {"const": 30}, "training_permitted": {"const": false}
+      }
+    }
+  }
+}

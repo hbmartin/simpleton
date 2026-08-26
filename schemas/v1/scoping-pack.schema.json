@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://simpleton.dev/schemas/v1/scoping-pack.schema.json",
+  "title": "Simpleton Scoping Pack",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "opportunities"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "run_id": {"type": "string", "minLength": 1},
+    "opportunities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "language", "category", "region", "evidence", "allowed_files", "benefit", "applicability_confidence", "risk", "review_effort", "rank"],
+        "properties": {
+          "id": {"type": "string"}, "language": {"type": "string"}, "category": {"type": "string"},
+          "region": {"type": "string"}, "evidence": {"type": "array", "items": {"type": "string"}},
+          "allowed_files": {"type": "array", "items": {"type": "string"}},
+          "benefit": {"type": "number", "minimum": 0, "maximum": 1},
+          "applicability_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+          "risk": {"type": "number", "minimum": 0, "maximum": 1},
+          "review_effort": {"type": "number", "minimum": 0, "maximum": 1},
+          "rank": {"type": "number", "minimum": 0}
+        }
+      }
+    }
+  }
+}
