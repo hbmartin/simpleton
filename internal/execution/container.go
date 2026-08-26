@@ -132,6 +132,9 @@ func classifyRunError(ctx context.Context, result CommandResult, runErr error, c
 			}
 		}
 		result.ExitCode = exitCode
+		if containerInfrastructureExitCode(exitCode) {
+			return result, fmt.Errorf("container runtime failed before the policy command completed (exit %d): %s", exitCode, strings.TrimSpace(stderr))
+		}
 		return result, nil
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(runErr, ctxErr) {
@@ -142,4 +145,8 @@ func classifyRunError(ctx context.Context, result CommandResult, runErr error, c
 
 func cancellationExitCode(exitCode int) bool {
 	return exitCode < 0 || runtime.GOOS == "windows" && exitCode == 1
+}
+
+func containerInfrastructureExitCode(exitCode int) bool {
+	return exitCode >= 125 && exitCode <= 127
 }

@@ -473,6 +473,10 @@ func (o ObservationSpec) Validate() error {
 		if err := o.Tolerances.Validate(); err != nil {
 			return err
 		}
+		if (o.Tolerances.Absolute != nil || o.Tolerances.Relative != nil) &&
+			(o.Comparator.BuiltIn == "exception_type" || o.Comparator.BuiltIn == "exception") {
+			return fmt.Errorf("tolerances are not supported by comparator %q", o.Comparator.BuiltIn)
+		}
 	}
 	return nil
 }

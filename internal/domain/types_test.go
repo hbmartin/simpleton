@@ -26,6 +26,18 @@ func TestChangeIntentRequiresExecutableContractParts(t *testing.T) {
 	}
 }
 
+func TestObservationRejectsToleranceForExceptionComparator(t *testing.T) {
+	absolute := 0.1
+	observation := ObservationSpec{
+		ID: "exception", Target: TargetRef{Language: "go", ScopeType: "api", Symbol: "Run"},
+		Preconditions: []HookRef{{BuiltIn: "always"}}, CallsOrEvents: []string{"Run"}, Observables: []string{"exception"},
+		Comparator: ComparatorSpec{BuiltIn: "exception"}, Tolerances: &Tolerances{Absolute: &absolute},
+	}
+	if err := observation.Validate(); err == nil {
+		t.Fatal("exception comparator silently accepted an inapplicable tolerance")
+	}
+}
+
 func TestPolicyCannotPromoteAdvisoryEvidence(t *testing.T) {
 	policy := testPolicy()
 	policy.Mode = "blocking"

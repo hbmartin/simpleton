@@ -42,6 +42,10 @@ func Compare(spec domain.ComparatorSpec, tolerances *domain.Tolerances, before, 
 		if err := tolerances.Validate(); err != nil {
 			return false, "", err
 		}
+		if (tolerances.Absolute != nil || tolerances.Relative != nil) &&
+			(spec.BuiltIn == "exception_type" || spec.BuiltIn == "exception") {
+			return false, "", fmt.Errorf("tolerances are not supported by comparator %q", spec.BuiltIn)
+		}
 	}
 	if spec.Symbol != "" {
 		return false, "", errors.New("repository comparator symbols must be executed by a language pack")
@@ -62,15 +66,16 @@ func Compare(spec domain.ComparatorSpec, tolerances *domain.Tolerances, before, 
 		equal, err := equalWithTolerance(left, right, tolerances)
 		return !equal, "JSON structures differ", err
 	case "unordered_collection":
-		left, err := canonicalCollection(before)
+		left, err := collectionItems(before)
 		if err != nil {
 			return false, "", fmt.Errorf("baseline observation: %w", err)
 		}
-		right, err := canonicalCollection(after)
+		right, err := collectionItems(after)
 		if err != nil {
 			return false, "", fmt.Errorf("candidate observation: %w", err)
 		}
-		return !reflect.DeepEqual(left, right), "collection members differ", nil
+		equal, err := unorderedEqual(left, right, tolerances)
+		return !equal, "collection members differ", err
 	case "exception_type":
 		left, err := exceptionField(before, "type")
 		if err != nil {
@@ -261,10 +266,16 @@ func number(value any) (*big.Rat, bool, error) {
 	switch typed := value.(type) {
 	case float64:
 		number, ok := finiteRat(typed)
-		return number, ok, nil
+		if !ok {
+			return nil, false, errors.New("numeric observations must be finite")
+		}
+		return number, true, nil
 	case float32:
 		number, ok := finiteRat(float64(typed))
-		return number, ok, nil
+		if !ok {
+			return nil, false, errors.New("numeric observations must be finite")
+		}
+		return number, true, nil
 	case int:
 		return new(big.Rat).SetInt64(int64(typed)), true, nil
 	case int8:
@@ -323,7 +334,7 @@ func asJSONValue(value any) (any, error) {
 	return parsed, nil
 }
 
-func canonicalCollection(value any) ([]string, error) {
+func collectionItems(value any) ([]any, error) {
 	parsed, err := asJSONValue(value)
 	if err != nil {
 		return nil, err
@@ -332,6 +343,67 @@ func canonicalCollection(value any) ([]string, error) {
 	if !ok {
 		return nil, errors.New("unordered_collection requires an array observation")
 	}
+	return items, nil
+}
+
+func unorderedEqual(left, right []any, tolerances *domain.Tolerances) (bool, error) {
+	if len(left) != len(right) {
+		return false, nil
+	}
+	if tolerances == nil || tolerances.Absolute == nil && tolerances.Relative == nil {
+		leftCanonical, err := canonicalItems(left)
+		if err != nil {
+			return false, err
+		}
+		rightCanonical, err := canonicalItems(right)
+		if err != nil {
+			return false, err
+		}
+		return reflect.DeepEqual(leftCanonical, rightCanonical), nil
+	}
+	matches := make([]int, len(right))
+	for index := range matches {
+		matches[index] = -1
+	}
+	var augment func(int, []bool) (bool, error)
+	augment = func(leftIndex int, seen []bool) (bool, error) {
+		for rightIndex := range right {
+			if seen[rightIndex] {
+				continue
+			}
+			equal, err := equalWithTolerance(left[leftIndex], right[rightIndex], tolerances)
+			if err != nil {
+				return false, err
+			}
+			if !equal {
+				continue
+			}
+			seen[rightIndex] = true
+			if matches[rightIndex] == -1 {
+				matches[rightIndex] = leftIndex
+				return true, nil
+			}
+			rematched, err := augment(matches[rightIndex], seen)
+			if err != nil {
+				return false, err
+			}
+			if rematched {
+				matches[rightIndex] = leftIndex
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	for leftIndex := range left {
+		matched, err := augment(leftIndex, make([]bool, len(right)))
+		if err != nil || !matched {
+			return matched, err
+		}
+	}
+	return true, nil
+}
+
+func canonicalItems(items []any) ([]string, error) {
 	result := make([]string, 0, len(items))
 	for _, item := range items {
 		encoded, err := canonicalJSON(item)

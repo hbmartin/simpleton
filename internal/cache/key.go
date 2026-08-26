@@ -2,6 +2,8 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -47,13 +49,14 @@ func LockfileDigests(ctx context.Context, repository gitx.Repository, revision s
 		if err != nil {
 			return nil, err
 		}
-		digest, err := domain.DigestJSON(string(content))
-		if err != nil {
-			return nil, err
-		}
-		result[path] = digest
+		result[path] = digestContent(content)
 	}
 	return result, nil
+}
+
+func digestContent(content []byte) string {
+	sum := sha256.Sum256(content)
+	return hex.EncodeToString(sum[:])
 }
 
 func isLockfile(path string) bool {

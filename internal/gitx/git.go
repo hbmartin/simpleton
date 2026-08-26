@@ -1,6 +1,7 @@
 package gitx
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -107,6 +109,75 @@ func (r Repository) FileAt(ctx context.Context, revision, path string) ([]byte, 
 	return r.run(ctx, "show", revision+":"+filepath.ToSlash(path))
 }
 
+// FilesAt reads repository blobs through one git cat-file batch process. The
+// returned map omits paths that do not resolve to blobs at the revision.
+func (r Repository) FilesAt(ctx context.Context, revision string, paths []string) (map[string][]byte, error) {
+	result := make(map[string][]byte, len(paths))
+	batchPaths := make([]string, 0, len(paths))
+	var input strings.Builder
+	for _, path := range paths {
+		if strings.ContainsRune(path, 0) || filepath.IsAbs(path) {
+			return nil, errors.New("git path must be relative and contain no NUL")
+		}
+		if strings.ContainsAny(path, "\r\n") {
+			content, err := r.FileAt(ctx, revision, path)
+			if err != nil {
+				return nil, err
+			}
+			result[path] = content
+			continue
+		}
+		batchPaths = append(batchPaths, path)
+		input.WriteString(revision)
+		input.WriteByte(':')
+		input.WriteString(filepath.ToSlash(path))
+		input.WriteByte('\n')
+	}
+	if len(batchPaths) == 0 {
+		return result, nil
+	}
+	cmd := exec.CommandContext(ctx, "git", "-C", r.Path, "cat-file", "--batch")
+	cmd.Stdin = strings.NewReader(input.String())
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	output, err := cmd.Output()
+	if err != nil {
+		message := strings.TrimSpace(stderr.String())
+		if message == "" {
+			message = err.Error()
+		}
+		return nil, fmt.Errorf("git cat-file --batch: %s", message)
+	}
+	reader := bufio.NewReader(bytes.NewReader(output))
+	for _, path := range batchPaths {
+		header, err := reader.ReadString('\n')
+		if err != nil {
+			return nil, fmt.Errorf("read git cat-file header for %q: %w", path, err)
+		}
+		fields := strings.Fields(strings.TrimSuffix(header, "\n"))
+		if len(fields) >= 2 && fields[len(fields)-1] == "missing" {
+			continue
+		}
+		if len(fields) < 3 || fields[len(fields)-2] != "blob" {
+			return nil, fmt.Errorf("unexpected git cat-file header for %q: %q", path, strings.TrimSpace(header))
+		}
+		size, err := strconv.ParseInt(fields[len(fields)-1], 10, 64)
+		if err != nil || size < 0 || size > int64(int(^uint(0)>>1)) {
+			return nil, fmt.Errorf("invalid git blob size for %q: %q", path, fields[len(fields)-1])
+		}
+		content := make([]byte, int(size))
+		if _, err := io.ReadFull(reader, content); err != nil {
+			return nil, fmt.Errorf("read git blob for %q: %w", path, err)
+		}
+		separator, err := reader.ReadByte()
+		if err != nil || separator != '\n' {
+			return nil, fmt.Errorf("invalid git blob delimiter for %q", path)
+		}
+		result[path] = content
+	}
+	return result, nil
+}
+
 func (r Repository) Patch(ctx context.Context, base, head string) ([]byte, error) {
 	return r.run(ctx, "diff", "--binary", "--no-ext-diff", base, head)
 }
@@ -130,6 +201,15 @@ func (r Repository) ListFiles(ctx context.Context, revision string) ([]string, e
 }
 
 func (r Repository) WorktreeDigest(ctx context.Context) (string, error) {
+	return r.worktreeDigest(ctx, worktreeDigestLimits{maxFileBytes: 256 << 20, maxNestedDepth: 8}, 0)
+}
+
+type worktreeDigestLimits struct {
+	maxFileBytes   int64
+	maxNestedDepth int
+}
+
+func (r Repository) worktreeDigest(ctx context.Context, limits worktreeDigestLimits, depth int) (string, error) {
 	status, err := r.run(ctx, "status", "--porcelain=v1", "-z", "--untracked-files=all")
 	if err != nil {
 		return "", err
@@ -160,14 +240,11 @@ func (r Repository) WorktreeDigest(ctx context.Context) (string, error) {
 			continue
 		}
 		path := string(rawPath)
-		content, kind, readErr := readWorktreeEntry(ctx, filepath.Join(r.Path, filepath.FromSlash(path)))
-		if readErr != nil {
-			return "", fmt.Errorf("read untracked path %q: %w", path, readErr)
-		}
 		writeDigestField(hash, []byte("entry"))
 		writeDigestField(hash, rawPath)
-		writeDigestField(hash, []byte(kind))
-		writeDigestField(hash, content)
+		if err := writeWorktreeEntry(ctx, hash, filepath.Join(r.Path, filepath.FromSlash(path)), limits, depth); err != nil {
+			return "", fmt.Errorf("read untracked path %q: %w", path, err)
+		}
 	}
 	return fmt.Sprintf("%x", hash.Sum(nil)), nil
 }
@@ -179,45 +256,147 @@ func writeDigestField(writer io.Writer, value []byte) {
 	_, _ = writer.Write(value)
 }
 
-func readWorktreeEntry(ctx context.Context, path string) ([]byte, string, error) {
-	info, err := os.Lstat(path)
+func writeWorktreeEntry(ctx context.Context, writer io.Writer, path string, limits worktreeDigestLimits, depth int) error {
+	info, err := lstatWithRetry(ctx, path)
 	if err != nil {
-		return nil, "", err
+		return err
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
-		target, err := os.Readlink(path)
-		return []byte(target), "symlink", err
+		target, err := readlinkWithRetry(ctx, path)
+		if err != nil {
+			return err
+		}
+		writeDigestField(writer, []byte("symlink"))
+		writeDigestField(writer, []byte(target))
+		return nil
 	}
 	if info.IsDir() {
-		return readNestedRepository(ctx, path)
+		if depth >= limits.maxNestedDepth {
+			return fmt.Errorf("nested repository depth exceeds %d", limits.maxNestedDepth)
+		}
+		nested := Repository{Path: path}
+		if _, err := nested.run(ctx, "rev-parse", "--git-dir"); err != nil {
+			return fmt.Errorf("unsupported directory entry: %w", err)
+		}
+		head, err := nested.run(ctx, "rev-parse", "--verify", "HEAD")
+		if err != nil {
+			head, err = nested.run(ctx, "symbolic-ref", "-q", "HEAD")
+			if err != nil {
+				head = []byte("unborn")
+			}
+		}
+		worktree, err := nested.worktreeDigest(ctx, limits, depth+1)
+		if err != nil {
+			return err
+		}
+		writeDigestField(writer, []byte("git_repository"))
+		writeDigestField(writer, bytes.TrimSpace(head))
+		writeDigestField(writer, []byte(worktree))
+		return nil
 	}
 	if !info.Mode().IsRegular() {
-		return nil, "", fmt.Errorf("unsupported file type %s", info.Mode().Type())
+		return fmt.Errorf("unsupported file type %s", info.Mode().Type())
 	}
-	content, err := os.ReadFile(path)
-	return content, "regular", err
+	digest, size, err := digestRegularFile(ctx, path, limits.maxFileBytes)
+	if err != nil {
+		return err
+	}
+	var encodedSize [8]byte
+	binary.BigEndian.PutUint64(encodedSize[:], uint64(size))
+	writeDigestField(writer, []byte("regular_sha256"))
+	writeDigestField(writer, encodedSize[:])
+	writeDigestField(writer, digest)
+	return nil
 }
 
-func readNestedRepository(ctx context.Context, path string) ([]byte, string, error) {
-	nested := Repository{Path: path}
-	if _, err := nested.run(ctx, "rev-parse", "--git-dir"); err != nil {
-		return nil, "", fmt.Errorf("unsupported directory entry: %w", err)
+func digestRegularFile(ctx context.Context, path string, maxBytes int64) ([]byte, int64, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		digest, size, err := digestRegularFileOnce(ctx, path, maxBytes)
+		if err == nil {
+			return digest, size, nil
+		}
+		if ctx.Err() != nil {
+			return nil, 0, ctx.Err()
+		}
+		lastErr = err
 	}
-	head, err := nested.run(ctx, "rev-parse", "--verify", "HEAD")
+	return nil, 0, fmt.Errorf("file remained unreadable after 3 attempts: %w", lastErr)
+}
+
+func digestRegularFileOnce(ctx context.Context, path string, maxBytes int64) ([]byte, int64, error) {
+	file, err := os.Open(path)
 	if err != nil {
-		head, err = nested.run(ctx, "symbolic-ref", "-q", "HEAD")
-		if err != nil {
-			head = []byte("unborn")
+		return nil, 0, err
+	}
+	defer file.Close()
+	before, err := file.Stat()
+	if err != nil {
+		return nil, 0, err
+	}
+	if before.Size() > maxBytes {
+		return nil, 0, fmt.Errorf("file size %d exceeds the %d-byte worktree digest limit", before.Size(), maxBytes)
+	}
+	hash := sha256.New()
+	buffer := make([]byte, 64<<10)
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
+		count, readErr := file.Read(buffer)
+		if count > 0 {
+			total += int64(count)
+			if total > maxBytes {
+				return nil, 0, fmt.Errorf("file exceeds the %d-byte worktree digest limit", maxBytes)
+			}
+			_, _ = hash.Write(buffer[:count])
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return nil, 0, readErr
 		}
 	}
-	worktree, err := nested.WorktreeDigest(ctx)
+	after, err := file.Stat()
 	if err != nil {
-		return nil, "", err
+		return nil, 0, err
 	}
-	var content bytes.Buffer
-	writeDigestField(&content, bytes.TrimSpace(head))
-	writeDigestField(&content, []byte(worktree))
-	return content.Bytes(), "git_repository", nil
+	if total != before.Size() || after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime()) {
+		return nil, 0, errors.New("file changed while it was being hashed")
+	}
+	return hash.Sum(nil), total, nil
+}
+
+func lstatWithRetry(ctx context.Context, path string) (os.FileInfo, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		info, err := os.Lstat(path)
+		if err == nil {
+			return info, nil
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("lstat failed after 3 attempts: %w", lastErr)
+}
+
+func readlinkWithRetry(ctx context.Context, path string) (string, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		target, err := os.Readlink(path)
+		if err == nil {
+			return target, nil
+		}
+		lastErr = err
+	}
+	return "", fmt.Errorf("readlink failed after 3 attempts: %w", lastErr)
 }
 
 func (r Repository) DetachedWorktree(ctx context.Context, revision string) (string, func() error, error) {

@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -73,5 +74,13 @@ func TestCancellationThatSignalsProcessWinsOverSignaledExit(t *testing.T) {
 	_, err := classifyRunError(ctx, CommandResult{}, runErr, true, "")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("winning cancellation was not preserved: %v", err)
+	}
+}
+
+func TestContainerInfrastructureExitIsExecutionFailure(t *testing.T) {
+	runErr := exec.CommandContext(t.Context(), "/bin/sh", "-c", "exit 125").Run()
+	result, err := classifyRunError(context.Background(), CommandResult{}, runErr, false, "daemon unavailable")
+	if err == nil || result.ExitCode != 125 || !strings.Contains(err.Error(), "failed before the policy command completed") {
+		t.Fatalf("container infrastructure failure was not distinguished: result=%#v err=%v", result, err)
 	}
 }

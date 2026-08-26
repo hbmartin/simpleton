@@ -45,6 +45,31 @@ func TestFloatingTolerance(t *testing.T) {
 	}
 }
 
+func TestUnorderedCollectionAppliesFloatingTolerance(t *testing.T) {
+	abs := 0.01
+	violated, _, err := Compare(domain.ComparatorSpec{BuiltIn: "unordered_collection"}, &domain.Tolerances{Absolute: &abs},
+		[]any{2.004, 1.005}, []any{1.0, 2.0})
+	if err != nil || violated {
+		t.Fatalf("unordered numeric members inside tolerance must match: violated=%t err=%v", violated, err)
+	}
+}
+
+func TestExceptionComparatorRejectsTolerance(t *testing.T) {
+	abs := 0.01
+	_, _, err := Compare(domain.ComparatorSpec{BuiltIn: "exception"}, &domain.Tolerances{Absolute: &abs},
+		map[string]any{"type": "Error", "message": "same"}, map[string]any{"type": "Error", "message": "same"})
+	if err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("exception comparator silently ignored tolerance: %v", err)
+	}
+}
+
+func TestExactComparisonRejectsNonFiniteObservation(t *testing.T) {
+	_, _, err := Compare(domain.ComparatorSpec{BuiltIn: "exact"}, nil, math.NaN(), math.NaN())
+	if err == nil || !strings.Contains(err.Error(), "must be finite") {
+		t.Fatalf("non-finite observations were compared ambiguously: %v", err)
+	}
+}
+
 func TestCompareRejectsInvalidTolerance(t *testing.T) {
 	for name, value := range map[string]float64{
 		"negative": -0.01,

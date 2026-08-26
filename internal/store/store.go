@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -29,7 +30,12 @@ func Open(root string) (*Store, error) {
 	if err := os.MkdirAll(objects, 0o700); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite3", filepath.Join(root, "simpleton.db"))
+	databaseURL := url.URL{Scheme: "file", Path: filepath.Join(root, "simpleton.db")}
+	query := databaseURL.Query()
+	query.Set("_foreign_keys", "on")
+	query.Set("_journal_mode", "WAL")
+	databaseURL.RawQuery = query.Encode()
+	db, err := sql.Open("sqlite3", databaseURL.String())
 	if err != nil {
 		return nil, err
 	}
@@ -211,8 +217,6 @@ func (s *Store) RecordOutcome(ctx context.Context, outcome Outcome) error {
 
 func (s *Store) migrate(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `
-		PRAGMA journal_mode=WAL;
-		PRAGMA foreign_keys=ON;
 		CREATE TABLE IF NOT EXISTS runs (
 			run_id TEXT PRIMARY KEY,
 			created_at TEXT NOT NULL,

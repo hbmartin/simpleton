@@ -237,6 +237,37 @@ func TestAnalyzeSortsChangedFiles(t *testing.T) {
 	}
 }
 
+func TestAnalyzeSkipsUnrelatedPackageTypeChecking(t *testing.T) {
+	repo := t.TempDir()
+	git(t, repo, "init", "-q")
+	git(t, repo, "config", "user.email", "simpleton@example.invalid")
+	git(t, repo, "config", "user.name", "Simpleton Test")
+	write(t, filepath.Join(repo, "go.mod"), "module example.invalid/scoped\n\ngo 1.24\n")
+	write(t, filepath.Join(repo, "dep", "value.go"), "package dep\n\nfunc Adjust(value int) int { return value }\n")
+	write(t, filepath.Join(repo, "caller", "caller.go"), "package caller\n\nimport \"example.invalid/scoped/dep\"\nfunc Public(value int) int { return dep.Adjust(value) }\n")
+	write(t, filepath.Join(repo, "unrelated", "broken.go"), "package unrelated\n\nvar Broken int = \"not an int\"\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-qm", "base")
+	base := git(t, repo, "rev-parse", "HEAD")
+	write(t, filepath.Join(repo, "dep", "value.go"), "package dep\n\nfunc Adjust(value int) int { return value + 1 }\n")
+	git(t, repo, "commit", "-qam", "candidate")
+	head := git(t, repo, "rev-parse", "HEAD")
+
+	result, err := (Handler{}).Analyze(context.Background(), packrpc.AnalyzeParams{
+		Repository: repo, BaseRevision: base, HeadRevision: head,
+		ChangedFiles: []gitx.ChangedFile{{Path: "dep/value.go", Language: "go"}}, BudgetMS: 10_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Methods[1].Status != domain.StatusRan {
+		t.Fatalf("unrelated package diagnostics contaminated scoped analysis: %#v", result.Methods[1])
+	}
+	if len(result.Targets) != 1 || len(result.Targets[0].ObservationCandidates) == 0 || result.Targets[0].ObservationCandidates[0].Symbol != "Public" {
+		t.Fatalf("reverse-dependent caller was not included: %#v", result.Targets)
+	}
+}
+
 func TestModuleMetadataDerivesPackagePathsWithoutCompilingRepository(t *testing.T) {
 	repo := t.TempDir()
 	git(t, repo, "init", "-q")
@@ -304,7 +335,7 @@ func TestTypeCheckHandlesCancellationBetweenPackageChecks(t *testing.T) {
 	}
 	baseCtx, cancel := context.WithCancel(context.Background())
 	ctx := &cancelAfterFirstErrContext{Context: baseCtx, cancel: cancel}
-	_, _, _, err = typeCheckSynchronously(ctx, fset, map[string]*ast.File{"sample.go": file}, packageMetadata{}, nil)
+	_, _, _, err = typeCheckSynchronously(ctx, fset, map[string]*ast.File{"sample.go": file}, packageMetadata{}, map[string]bool{"sample.go": true}, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("type checking returned the wrong cancellation error: %v", err)
 	}
@@ -320,7 +351,7 @@ func TestTypeCheckReturnsWhenFallbackImporterIgnoresCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	returned := make(chan error, 1)
 	go func() {
-		_, _, _, err := typeCheckWithImporter(ctx, fset, map[string]*ast.File{"sample.go": file}, packageMetadata{}, importer)
+		_, _, _, err := typeCheckWithImporter(ctx, fset, map[string]*ast.File{"sample.go": file}, packageMetadata{}, map[string]bool{"sample.go": true}, importer)
 		returned <- err
 	}()
 	<-importer.started
