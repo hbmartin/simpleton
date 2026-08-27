@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -109,6 +110,23 @@ func TestFilesAtOmitsIndividualNonBlobAndMissingPath(t *testing.T) {
 	}
 	if len(files) != 1 || string(files["directory/value.txt"]) != "value" {
 		t.Fatalf("per-path failures affected valid blobs: %#v", files)
+	}
+}
+
+func TestRetryableFilesystemErrorsIncludeNetworkAndWindowsTransientFailures(t *testing.T) {
+	for _, err := range []error{
+		&os.PathError{Op: "read", Path: "network", Err: syscall.ESTALE},
+		&os.PathError{Op: "read", Path: "network", Err: syscall.EIO},
+	} {
+		if !retryableFilesystemError(err) {
+			t.Fatalf("transient filesystem error was not retryable: %v", err)
+		}
+	}
+	if !retryableFilesystemErrno(syscall.Errno(32), "windows") {
+		t.Fatal("Windows sharing violation was not retryable")
+	}
+	if retryableFilesystemErrno(syscall.EINVAL, "linux") {
+		t.Fatal("deterministic invalid-argument failure was retryable")
 	}
 }
 

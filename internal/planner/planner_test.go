@@ -405,13 +405,46 @@ func TestManagedReviewPayloadPreservesAllowlistedSemantics(t *testing.T) {
 			Applicable: false, Reason: "effect risks require an approved stable observation boundary",
 			Risks: []string{"concurrency", "untrusted-secret-risk"},
 		},
+	}, {
+		ID: "second-target", Language: "typescript", File: "web/value.ts", Symbol: "private/invalid", Kind: "method", ScopeType: "symbol",
+		ObservationCandidates: []domain.ObservationBoundary{{Kind: "direct_unit", Symbol: "Second.Run", Path: "web/value.ts"}},
+		Applicability:         domain.RunApplicability{Applicable: false, Reason: "no statically detected effects", Risks: []string{"imports_node_http2"}},
 	}}
-	paths := map[string]struct{}{"internal/value.go": {}, "internal/caller.go": {}}
+	paths := map[string]struct{}{"internal/value.go": {}, "internal/caller.go": {}, "web/value.ts": {}}
 	reviewTargets := managedReviewTargets(targets, paths)
-	reviewMethods := managedReviewMethodResults([]domain.MethodResult{{ID: "go_type_analysis", Status: domain.StatusRan}})
+	methods := []domain.MethodResult{
+		{ID: "go_type_analysis", Status: domain.StatusRan, Findings: []domain.Finding{{ID: "type-finding", MethodID: "go_type_analysis"}}},
+		{ID: "acme_unreleased_fuzzer", Status: domain.StatusExecutionFailed, Reason: "/Users/alice/private/diagnostic", Findings: []domain.Finding{{ID: "custom-finding", MethodID: "acme_unreleased_fuzzer"}}},
+	}
+	reviewMethods := managedReviewMethodResults(methods)
 	if reviewTargets[0].Symbol != "Value.Adjust" || reviewTargets[0].ObservationCandidates[0].Symbol != "Caller.Run" ||
-		!slices.Equal(reviewTargets[0].Applicability.Risks, []string{"concurrency"}) || reviewMethods[0].ID != "go_type_analysis" {
+		!slices.Equal(reviewTargets[0].Applicability.Risks, []string{"concurrency"}) || reviewTargets[1].Symbol != "" ||
+		reviewTargets[1].ObservationCandidates[0].Symbol != "Second.Run" || !slices.Equal(reviewTargets[1].Applicability.Risks, []string{"imports_node_http2"}) ||
+		reviewMethods[0].ID != "go_type_analysis" || reviewMethods[0].Findings[0].MethodID != reviewMethods[0].ID ||
+		reviewMethods[1].ID == "acme_unreleased_fuzzer" || reviewMethods[1].Findings[0].MethodID != reviewMethods[1].ID {
 		t.Fatalf("managed review lost safe semantic evidence: targets=%#v methods=%#v", reviewTargets, reviewMethods)
+	}
+	payload, err := json.Marshal(reviewMethods)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"acme_unreleased_fuzzer", "/Users/alice/private/diagnostic"} {
+		if strings.Contains(string(payload), forbidden) {
+			t.Fatalf("managed review exposed user-controlled method metadata %q: %s", forbidden, payload)
+		}
+	}
+	if methods[1].Reason != "/Users/alice/private/diagnostic" || methods[1].ID != "acme_unreleased_fuzzer" {
+		t.Fatalf("managed review sanitization mutated local evidence: %#v", methods[1])
+	}
+}
+
+func TestManagedRiskAllowlistCoversNormalizedPackVocabulary(t *testing.T) {
+	risks := []string{
+		"imports_fs", "imports_node_fs", "imports_http2", "imports_node_http2", "imports_timers", "imports_node_timers",
+		"imports_net_http", "imports_asyncio", "concurrency", "async", "call_readFile", "call_open",
+	}
+	if managed := managedRisks(risks); !slices.Equal(managed, risks) {
+		t.Fatalf("managed review dropped normalized pack risks: got=%#v want=%#v", managed, risks)
 	}
 }
 

@@ -772,65 +772,69 @@ func (p Planner) resolveIntent(request Request, changed []gitx.ChangedFile, base
 func (p Planner) runCommands(ctx context.Context, baselineRepo, candidateRepo string, policy domain.Policy) []domain.MethodResult {
 	results := make([]domain.MethodResult, 0, len(policy.Commands))
 	for _, spec := range policy.Commands {
-		budget := policy.Budgets.Total.Duration()
-		if configured, ok := policy.Budgets.Methods[spec.ID]; ok {
-			budget = configured.Duration()
-		}
-		started := time.Now()
-		image := spec.Image
-		if image == "" {
-			image = policy.Execution.Image
-		}
-		methodCtx, methodCancel := context.WithTimeout(ctx, budget)
-		baseline, baselineErr := p.Runner.Run(methodCtx, baselineRepo, policy.Execution, image, spec.Command)
-		method := domain.MethodResult{ID: spec.ID, Language: spec.Language, Budget: budget.String(), Findings: []domain.Finding{}}
-		switch {
-		case errors.Is(methodCtx.Err(), context.DeadlineExceeded) || errors.Is(baselineErr, context.DeadlineExceeded):
-			method.Status = domain.StatusBudgetExhausted
-			method.Reason = "baseline command exceeded its policy budget"
-		case baselineErr != nil:
-			method.Status = domain.StatusExecutionFailed
-			method.Reason = "baseline command could not run: " + baselineErr.Error()
-		case baseline.UnsupportedReason != "":
-			method.Status = domain.StatusUnsupported
-			method.Reason = "baseline command is unsupported: " + baseline.UnsupportedReason
-		case infrastructureExit(baseline.ExitCode):
-			method.Status = domain.StatusExecutionFailed
-			method.Reason = fmt.Sprintf("baseline container infrastructure failed with exit code %d", baseline.ExitCode)
-		case baseline.ExitCode != 0:
-			method.Status = domain.StatusInconclusive
-			method.Reason = fmt.Sprintf("baseline command failed with exit code %d; a regression cannot be established", baseline.ExitCode)
-		default:
-			candidate, candidateErr := p.Runner.Run(methodCtx, candidateRepo, policy.Execution, image, spec.Command)
-			switch {
-			case errors.Is(methodCtx.Err(), context.DeadlineExceeded) || errors.Is(candidateErr, context.DeadlineExceeded):
-				method.Status = domain.StatusBudgetExhausted
-				method.Reason = "candidate command exceeded its policy budget"
-			case candidateErr != nil:
-				method.Status = domain.StatusExecutionFailed
-				method.Reason = "candidate command could not run: " + candidateErr.Error()
-			case candidate.UnsupportedReason != "":
-				method.Status = domain.StatusUnsupported
-				method.Reason = "candidate command is unsupported: " + candidate.UnsupportedReason
-			case infrastructureExit(candidate.ExitCode):
-				method.Status = domain.StatusExecutionFailed
-				method.Reason = fmt.Sprintf("candidate container infrastructure failed with exit code %d", candidate.ExitCode)
-			case candidate.ExitCode != 0:
-				method.Status = domain.StatusRan
-				method.Findings = append(method.Findings, domain.Finding{
-					ID: domain.StableID(spec.ID, candidate.Stdout, candidate.Stderr), Category: spec.Category,
-					Title: spec.ID + " reported a regression", Detail: truncate(candidate.Stdout+"\n"+candidate.Stderr, 16<<10),
-					Validated: true, Advisory: false, MethodID: spec.ID,
-				})
-			default:
-				method.Status = domain.StatusRan
-			}
-		}
-		methodCancel()
-		method.DurationMS = time.Since(started).Milliseconds()
-		results = append(results, method)
+		results = append(results, p.runCommandMethod(ctx, baselineRepo, candidateRepo, policy, spec))
 	}
 	return results
+}
+
+func (p Planner) runCommandMethod(ctx context.Context, baselineRepo, candidateRepo string, policy domain.Policy, spec domain.CommandSpec) domain.MethodResult {
+	budget := policy.Budgets.Total.Duration()
+	if configured, ok := policy.Budgets.Methods[spec.ID]; ok {
+		budget = configured.Duration()
+	}
+	started := time.Now()
+	image := spec.Image
+	if image == "" {
+		image = policy.Execution.Image
+	}
+	methodCtx, methodCancel := context.WithTimeout(ctx, budget)
+	defer methodCancel()
+	baseline, baselineErr := p.Runner.Run(methodCtx, baselineRepo, policy.Execution, image, spec.Command)
+	method := domain.MethodResult{ID: spec.ID, Language: spec.Language, Budget: budget.String(), Findings: []domain.Finding{}}
+	switch {
+	case errors.Is(methodCtx.Err(), context.DeadlineExceeded) || errors.Is(baselineErr, context.DeadlineExceeded):
+		method.Status = domain.StatusBudgetExhausted
+		method.Reason = "method budget exhausted during baseline command"
+	case baselineErr != nil:
+		method.Status = domain.StatusExecutionFailed
+		method.Reason = "baseline command could not run: " + baselineErr.Error()
+	case baseline.UnsupportedReason != "":
+		method.Status = domain.StatusUnsupported
+		method.Reason = "baseline command is unsupported: " + baseline.UnsupportedReason
+	case infrastructureExit(baseline.ExitCode):
+		method.Status = domain.StatusExecutionFailed
+		method.Reason = fmt.Sprintf("baseline container infrastructure failed with exit code %d", baseline.ExitCode)
+	case baseline.ExitCode != 0:
+		method.Status = domain.StatusInconclusive
+		method.Reason = fmt.Sprintf("baseline command failed with exit code %d; a regression cannot be established", baseline.ExitCode)
+	default:
+		candidate, candidateErr := p.Runner.Run(methodCtx, candidateRepo, policy.Execution, image, spec.Command)
+		switch {
+		case errors.Is(methodCtx.Err(), context.DeadlineExceeded) || errors.Is(candidateErr, context.DeadlineExceeded):
+			method.Status = domain.StatusBudgetExhausted
+			method.Reason = "method budget exhausted during candidate command"
+		case candidateErr != nil:
+			method.Status = domain.StatusExecutionFailed
+			method.Reason = "candidate command could not run: " + candidateErr.Error()
+		case candidate.UnsupportedReason != "":
+			method.Status = domain.StatusUnsupported
+			method.Reason = "candidate command is unsupported: " + candidate.UnsupportedReason
+		case infrastructureExit(candidate.ExitCode):
+			method.Status = domain.StatusExecutionFailed
+			method.Reason = fmt.Sprintf("candidate container infrastructure failed with exit code %d", candidate.ExitCode)
+		case candidate.ExitCode != 0:
+			method.Status = domain.StatusRan
+			method.Findings = append(method.Findings, domain.Finding{
+				ID: domain.StableID(spec.ID, candidate.Stdout, candidate.Stderr), Category: spec.Category,
+				Title: spec.ID + " reported a regression", Detail: truncate(candidate.Stdout+"\n"+candidate.Stderr, 16<<10),
+				Validated: true, Advisory: false, MethodID: spec.ID,
+			})
+		default:
+			method.Status = domain.StatusRan
+		}
+	}
+	method.DurationMS = time.Since(started).Milliseconds()
+	return method
 }
 
 func infrastructureExit(exitCode int) bool {
@@ -993,44 +997,57 @@ func managedCapabilities(capabilities []domain.PackCapability) []domain.PackCapa
 func managedTargets(targets []domain.VerificationTarget, repositoryPaths map[string]struct{}) []domain.VerificationTarget {
 	result := make([]domain.VerificationTarget, 0, len(targets))
 	for _, target := range targets {
-		boundaries := make([]domain.ObservationBoundary, 0, len(target.ObservationCandidates))
-		for _, boundary := range target.ObservationCandidates {
-			boundaries = append(boundaries, domain.ObservationBoundary{
-				Kind: managedEnum(boundary.Kind, "unchanged_caller", "public_api", "direct_unit"),
-				Path: managedPath(boundary.Path, repositoryPaths), Stable: boundary.Stable, Generated: boundary.Generated,
-				Confidence: boundary.Confidence,
-			})
-		}
-		result = append(result, domain.VerificationTarget{
-			ID: managedID("target", target.ID), Language: managedLanguage(target.Language),
-			File: managedPath(target.File, repositoryPaths), Kind: managedEnum(target.Kind, "function", "method", "type", "module", "package", "file"),
-			ScopeType:        managedEnum(target.ScopeType, "symbol", "api", "file", "package", "module"),
-			BaselineArtifact: managedPath(target.BaselineArtifact, repositoryPaths), CandidateArtifact: managedPath(target.CandidateArtifact, repositoryPaths),
-			Dependencies: managedPaths(target.Dependencies, repositoryPaths), ObservationCandidates: boundaries,
-			Applicability: domain.RunApplicability{Applicable: target.Applicability.Applicable, Confidence: target.Applicability.Confidence},
-		})
+		result = append(result, managedTarget(target, repositoryPaths, false))
 	}
 	return result
 }
 
-var managedSemanticSymbolPattern = regexp.MustCompile(`^(?:<module>|[A-Za-z_$][A-Za-z0-9_.$]*)$`)
+func managedTarget(target domain.VerificationTarget, repositoryPaths map[string]struct{}, review bool) domain.VerificationTarget {
+	boundaries := make([]domain.ObservationBoundary, 0, len(target.ObservationCandidates))
+	for _, boundary := range target.ObservationCandidates {
+		managed := domain.ObservationBoundary{
+			Kind: managedEnum(boundary.Kind, "unchanged_caller", "public_api", "direct_unit"),
+			Path: managedPath(boundary.Path, repositoryPaths), Stable: boundary.Stable, Generated: boundary.Generated,
+			Confidence: boundary.Confidence,
+		}
+		if review {
+			managed.Symbol = managedReviewSymbol(boundary.Symbol)
+		}
+		boundaries = append(boundaries, managed)
+	}
+	managed := domain.VerificationTarget{
+		ID: managedID("target", target.ID), Language: managedLanguage(target.Language),
+		File: managedPath(target.File, repositoryPaths), Kind: managedEnum(target.Kind, "function", "method", "type", "module", "package", "file"),
+		ScopeType:        managedEnum(target.ScopeType, "symbol", "api", "file", "package", "module"),
+		BaselineArtifact: managedPath(target.BaselineArtifact, repositoryPaths), CandidateArtifact: managedPath(target.CandidateArtifact, repositoryPaths),
+		Dependencies: managedPaths(target.Dependencies, repositoryPaths), ObservationCandidates: boundaries,
+		Applicability: domain.RunApplicability{Applicable: target.Applicability.Applicable, Confidence: target.Applicability.Confidence},
+	}
+	if review {
+		managed.Symbol = managedReviewSymbol(target.Symbol)
+		managed.Applicability.Reason = managedApplicabilityReason(target.Applicability.Reason)
+		managed.Applicability.Risks = managedRisks(target.Applicability.Risks)
+	}
+	return managed
+}
 
-func managedSemanticSymbol(value string) string {
-	if len(value) > 256 || !managedSemanticSymbolPattern.MatchString(value) {
+// Repository symbols are intentionally useful semantic context for the
+// opt-in managed review. Accept only identifier-shaped values here; method IDs
+// use the fixed value allowlist below because policy and observation IDs are
+// user-controlled metadata rather than source symbols.
+var managedReviewSymbolPattern = regexp.MustCompile(`^(?:<module>|[A-Za-z_$][A-Za-z0-9_.$]*)$`)
+
+func managedReviewSymbol(value string) string {
+	if len(value) > 256 || !managedReviewSymbolPattern.MatchString(value) {
 		return ""
 	}
 	return value
 }
 
 func managedReviewTargets(targets []domain.VerificationTarget, repositoryPaths map[string]struct{}) []domain.VerificationTarget {
-	result := managedTargets(targets, repositoryPaths)
-	for index := range result {
-		result[index].Symbol = managedSemanticSymbol(targets[index].Symbol)
-		result[index].Applicability.Reason = managedApplicabilityReason(targets[index].Applicability.Reason)
-		result[index].Applicability.Risks = managedRisks(targets[index].Applicability.Risks)
-		for boundaryIndex := range result[index].ObservationCandidates {
-			result[index].ObservationCandidates[boundaryIndex].Symbol = managedSemanticSymbol(targets[index].ObservationCandidates[boundaryIndex].Symbol)
-		}
+	result := make([]domain.VerificationTarget, 0, len(targets))
+	for _, target := range targets {
+		result = append(result, managedTarget(target, repositoryPaths, true))
 	}
 	return result
 }
@@ -1050,7 +1067,7 @@ var managedRiskAllowlist = []string{
 	"call_uuid4", "call_writeFile",
 	"imports_asyncio", "imports_child_process", "imports_crypto", "imports_crypto_rand", "imports_database_sql",
 	"imports_fs", "imports_http", "imports_https", "imports_io", "imports_math_rand", "imports_net",
-	"imports_net_http", "imports_node_child_process", "imports_node_crypto", "imports_node_fs", "imports_node_http",
+	"imports_http2", "imports_net_http", "imports_node_child_process", "imports_node_crypto", "imports_node_fs", "imports_node_http", "imports_node_http2",
 	"imports_node_https", "imports_node_net", "imports_node_timers", "imports_node_worker_threads", "imports_os",
 	"imports_random", "imports_secrets", "imports_socket", "imports_subprocess", "imports_sync", "imports_threading",
 	"imports_time", "imports_timers", "imports_worker_threads",
@@ -1069,40 +1086,73 @@ func managedRisks(risks []string) []string {
 func managedMethodResults(methods []domain.MethodResult) []domain.MethodResult {
 	result := make([]domain.MethodResult, 0, len(methods))
 	for _, method := range methods {
-		managed := domain.MethodResult{
-			ID: managedID("method", method.ID), Language: managedLanguage(method.Language), Status: managedMethodStatus(method.Status),
-			Budget: managedDuration(method.Budget), DurationMS: method.DurationMS, CostUSD: method.CostUSD,
-			Coverage: method.Coverage, Findings: managedFindings(method.Findings),
-		}
-		if method.Applicability != nil {
-			managed.Applicability = &domain.RunApplicability{Applicable: method.Applicability.Applicable, Confidence: method.Applicability.Confidence}
-		}
-		result = append(result, managed)
+		result = append(result, managedMethodResult(method, false))
 	}
 	return result
 }
 
+var managedReviewMethodIDAllowlist = []string{
+	"structural_diff",
+	"go_pack", "go_native_analysis", "go_type_analysis", "go_native_probe",
+	"python_pack", "python_native_analysis", "python_native_probe",
+	"typescript_pack", "typescript_native_analysis", "typescript_type_analysis", "typescript_native_probe",
+	"swift_pack", "swift_native_analysis", "swift_type_analysis", "swift_native_probe",
+}
+
+func managedReviewMethodID(value string) string {
+	if managed := managedEnum(value, managedReviewMethodIDAllowlist...); managed != "" {
+		return managed
+	}
+	return managedID("method", value)
+}
+
 func managedReviewMethodResults(methods []domain.MethodResult) []domain.MethodResult {
-	result := managedMethodResults(methods)
-	for index := range result {
-		if semanticID := managedSemanticSymbol(methods[index].ID); semanticID != "" {
-			result[index].ID = semanticID
-		}
+	result := make([]domain.MethodResult, 0, len(methods))
+	for _, method := range methods {
+		result = append(result, managedMethodResult(method, true))
 	}
 	return result
+}
+
+func managedMethodResult(method domain.MethodResult, review bool) domain.MethodResult {
+	id := managedID("method", method.ID)
+	if review {
+		id = managedReviewMethodID(method.ID)
+	}
+	findings := make([]domain.Finding, 0, len(method.Findings))
+	for _, finding := range method.Findings {
+		findings = append(findings, managedFinding(finding, review))
+	}
+	managed := domain.MethodResult{
+		ID: id, Language: managedLanguage(method.Language), Status: managedMethodStatus(method.Status),
+		Budget: managedDuration(method.Budget), DurationMS: method.DurationMS, CostUSD: method.CostUSD,
+		Coverage: method.Coverage, Findings: findings,
+	}
+	if method.Applicability != nil {
+		managed.Applicability = &domain.RunApplicability{Applicable: method.Applicability.Applicable, Confidence: method.Applicability.Confidence}
+	}
+	return managed
 }
 
 func managedFindings(findings []domain.Finding) []domain.Finding {
 	result := make([]domain.Finding, 0, len(findings))
 	for _, finding := range findings {
-		result = append(result, domain.Finding{
-			ID: managedID("finding", finding.ID), Category: managedFindingCategory(finding.Category), Title: "managed finding",
-			Severity: managedEnum(finding.Severity, "info", "low", "medium", "high", "critical", "warning", "error"),
-			TargetID: managedID("target", finding.TargetID), MethodID: managedID("method", finding.MethodID),
-			Validated: finding.Validated, Advisory: finding.Advisory,
-		})
+		result = append(result, managedFinding(finding, false))
 	}
 	return result
+}
+
+func managedFinding(finding domain.Finding, review bool) domain.Finding {
+	methodID := managedID("method", finding.MethodID)
+	if review {
+		methodID = managedReviewMethodID(finding.MethodID)
+	}
+	return domain.Finding{
+		ID: managedID("finding", finding.ID), Category: managedFindingCategory(finding.Category), Title: "managed finding",
+		Severity: managedEnum(finding.Severity, "info", "low", "medium", "high", "critical", "warning", "error"),
+		TargetID: managedID("target", finding.TargetID), MethodID: methodID,
+		Validated: finding.Validated, Advisory: finding.Advisory,
+	}
 }
 
 func managedDivergences(divergences []domain.ObservedDivergence) []domain.ObservedDivergence {

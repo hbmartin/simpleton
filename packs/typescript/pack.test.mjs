@@ -68,6 +68,42 @@ test("gives anonymous default class methods a collision-free scope", async (t) =
   assert.equal(new Set(targets.map((target) => target.id)).size, 2);
 });
 
+test("keeps anonymous class identities stable when preceding text shifts", async (t) => {
+  const { repo, revision: firstRevision } = await repository(t, {
+    "sample.ts": "declare function consume(value: unknown): void;\nconsume(class { run() { return 1; } });\n",
+  });
+  const analyze = async (revision) => {
+    const responses = await runPack([
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocol_version: "1" } },
+      { jsonrpc: "2.0", id: 2, method: "analyze", params: {
+        repository: repo, head_revision: revision, changed_files: [{ path: "sample.ts", language: "typescript" }], budget_ms: 1000,
+      } },
+    ]);
+    return responses[1].result.targets.find((target) => target.symbol.endsWith(".run"));
+  };
+  const first = await analyze(firstRevision);
+  await writeFile(path.join(repo, "sample.ts"), "import \"node:fs\";\ndeclare function consume(value: unknown): void;\nconsume(class { run() { return 1; } });\n", "utf8");
+  execFileSync("git", ["-C", repo, "commit", "-qam", "shift source"]);
+  const secondRevision = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const second = await analyze(secondRevision);
+  assert.equal(second.symbol, first.symbol);
+  assert.equal(second.id, first.id);
+});
+
+test("normalizes modern Node effect imports", async (t) => {
+  const { repo, revision } = await repository(t, {
+    "sample.ts": "import { readFile } from 'node:fs/promises';\nimport { setTimeout as delay } from 'node:timers/promises';\nimport * as http2 from 'node:http2';\nexport async function run() { await delay(1); return [readFile, http2]; }\n",
+  });
+  const responses = await runPack([
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocol_version: "1" } },
+    { jsonrpc: "2.0", id: 2, method: "analyze", params: {
+      repository: repo, head_revision: revision, changed_files: [{ path: "sample.ts", language: "typescript" }], budget_ms: 1000,
+    } },
+  ]);
+  const target = responses[1].result.targets.find((candidate) => candidate.symbol === "run");
+  assert.deepEqual(new Set(target.applicability.risks), new Set(["async", "imports_node_fs", "imports_node_http2", "imports_node_timers"]));
+});
+
 test("restores caller scope after nested functions", async (t) => {
   const { repo, revision } = await repository(t, {
     "target.ts": "export function target() { return 1; }\n",

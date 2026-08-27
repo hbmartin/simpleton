@@ -8,6 +8,8 @@ import ts from "typescript";
 const PROTOCOL_VERSION = "1";
 const PACK_VERSION = "0.1.1";
 const MAX_GIT_OUTPUT = 32 * 1024 * 1024;
+const anonymousClassNames = new WeakMap();
+const indexedClassSources = new WeakSet();
 
 const capability = {
   language: "typescript",
@@ -218,10 +220,29 @@ function isClassLike(node) {
 }
 
 function className(node) {
+  const explicit = explicitClassName(node);
+  if (explicit) return explicit;
+  const source = node.getSourceFile();
+  if (!indexedClassSources.has(source)) {
+    let ordinal = 0;
+    const visit = (child) => {
+      if (isClassLike(child) && !explicitClassName(child)) {
+        anonymousClassNames.set(child, `AnonymousClass${ordinal}`);
+        ordinal += 1;
+      }
+      ts.forEachChild(child, visit);
+    };
+    visit(source);
+    indexedClassSources.add(source);
+  }
+  return anonymousClassNames.get(node) ?? "AnonymousClass";
+}
+
+function explicitClassName(node) {
   if (node.name && ts.isIdentifier(node.name)) return node.name.text;
   if (node.parent && ts.isVariableDeclaration(node.parent) && ts.isIdentifier(node.parent.name)) return node.parent.name.text;
   if (ts.isClassDeclaration(node) && node.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword)) return "default";
-  return `AnonymousClass${node.pos}`;
+  return "";
 }
 
 function functionName(node) {
@@ -246,7 +267,8 @@ function effectRisks(node, source) {
   for (const statement of source.statements) {
     if (ts.isImportDeclaration(statement)) {
       const module = statement.moduleSpecifier.text;
-      if (/^(?:node:)?(?:fs|net|http|https|crypto|worker_threads|child_process|timers)/.test(module)) risks.add(`imports_${module.replace(/\W/g, "_")}`);
+      const match = /^(node:)?(fs|net|http|https|http2|crypto|worker_threads|child_process|timers)(?:\/|$)/.exec(module);
+      if (match) risks.add(`imports_${match[1] ? "node_" : ""}${match[2]}`);
     }
   }
   if (node.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)) risks.add("async");

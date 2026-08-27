@@ -177,6 +177,73 @@ func TestAnalyzeResolvesInterfaceCallerWithoutImplementationImport(t *testing.T)
 	t.Fatalf("Task.Run target was not found: %#v", result.Targets)
 }
 
+func TestAnalyzeResolvesStandardLibraryInterfaceCallerWithoutImplementationImport(t *testing.T) {
+	repo := t.TempDir()
+	git(t, repo, "init", "-q")
+	git(t, repo, "config", "user.email", "simpleton@example.invalid")
+	git(t, repo, "config", "user.name", "Simpleton Test")
+	write(t, filepath.Join(repo, "go.mod"), "module example.invalid/stdlibdispatch\n\ngo 1.24\n")
+	write(t, filepath.Join(repo, "impl", "writer.go"), "package impl\n\ntype Writer struct{}\nfunc (*Writer) Write(value []byte) (int, error) { return len(value), nil }\n")
+	write(t, filepath.Join(repo, "consumer", "use.go"), "package consumer\n\nimport \"io\"\n\nfunc Use(writer io.Writer) { _, _ = writer.Write(nil) }\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-qm", "base")
+	base := git(t, repo, "rev-parse", "HEAD")
+	write(t, filepath.Join(repo, "impl", "writer.go"), "package impl\n\ntype Writer struct{}\nfunc (*Writer) Write(value []byte) (int, error) { return len(value) + 1, nil }\n")
+	git(t, repo, "commit", "-qam", "candidate")
+	head := git(t, repo, "rev-parse", "HEAD")
+
+	result, err := (Handler{}).Analyze(context.Background(), packrpc.AnalyzeParams{
+		Repository: repo, BaseRevision: base, HeadRevision: head,
+		ChangedFiles: []gitx.ChangedFile{{Path: "impl/writer.go", Language: "go"}}, BudgetMS: 10_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertUnchangedCaller(t, result, "Writer.Write", "consumer/use.go", "Use")
+}
+
+func TestAnalyzeResolvesCallerThroughEmbeddedStandardLibraryInterface(t *testing.T) {
+	repo := t.TempDir()
+	git(t, repo, "init", "-q")
+	git(t, repo, "config", "user.email", "simpleton@example.invalid")
+	git(t, repo, "config", "user.name", "Simpleton Test")
+	write(t, filepath.Join(repo, "go.mod"), "module example.invalid/embeddedstdlib\n\ngo 1.24\n")
+	write(t, filepath.Join(repo, "api", "writer.go"), "package api\n\nimport \"io\"\n\ntype Writer interface { io.Writer }\n")
+	write(t, filepath.Join(repo, "impl", "writer.go"), "package impl\n\nimport \"example.invalid/embeddedstdlib/api\"\n\ntype Writer struct{}\nvar _ api.Writer = (*Writer)(nil)\nfunc (*Writer) Write(value []byte) (int, error) { return len(value), nil }\n")
+	write(t, filepath.Join(repo, "consumer", "use.go"), "package consumer\n\nimport \"example.invalid/embeddedstdlib/api\"\n\nfunc Use(writer api.Writer) { _, _ = writer.Write(nil) }\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-qm", "base")
+	base := git(t, repo, "rev-parse", "HEAD")
+	write(t, filepath.Join(repo, "impl", "writer.go"), "package impl\n\nimport \"example.invalid/embeddedstdlib/api\"\n\ntype Writer struct{}\nvar _ api.Writer = (*Writer)(nil)\nfunc (*Writer) Write(value []byte) (int, error) { return len(value) + 1, nil }\n")
+	git(t, repo, "commit", "-qam", "candidate")
+	head := git(t, repo, "rev-parse", "HEAD")
+
+	result, err := (Handler{}).Analyze(context.Background(), packrpc.AnalyzeParams{
+		Repository: repo, BaseRevision: base, HeadRevision: head,
+		ChangedFiles: []gitx.ChangedFile{{Path: "impl/writer.go", Language: "go"}}, BudgetMS: 10_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertUnchangedCaller(t, result, "Writer.Write", "consumer/use.go", "Use")
+}
+
+func assertUnchangedCaller(t *testing.T, result packrpc.AnalyzeResult, targetSymbol, callerPath, callerSymbol string) {
+	t.Helper()
+	for _, target := range result.Targets {
+		if target.Symbol != targetSymbol {
+			continue
+		}
+		for _, boundary := range target.ObservationCandidates {
+			if boundary.Kind == "unchanged_caller" && boundary.Path == callerPath && boundary.Symbol == callerSymbol {
+				return
+			}
+		}
+		t.Fatalf("caller %s:%s was not resolved for %s: %#v", callerPath, callerSymbol, targetSymbol, target.ObservationCandidates)
+	}
+	t.Fatalf("target %s was not found: %#v", targetSymbol, result.Targets)
+}
+
 func TestAnalyzeResolvesInterfaceDispatchToPromotedMethod(t *testing.T) {
 	repo := t.TempDir()
 	git(t, repo, "init", "-q")
@@ -306,7 +373,7 @@ func TestAnalyzeSkipsUnrelatedPackageTypeChecking(t *testing.T) {
 	}
 }
 
-func TestAnalyzeMethodChangeSkipsUnrelatedPackageTypeChecking(t *testing.T) {
+func TestAnalyzeMethodChangeRetainsRepositoryWideInterfaceFallback(t *testing.T) {
 	repo := t.TempDir()
 	git(t, repo, "init", "-q")
 	git(t, repo, "config", "user.email", "simpleton@example.invalid")
@@ -329,11 +396,54 @@ func TestAnalyzeMethodChangeSkipsUnrelatedPackageTypeChecking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Methods[1].Status != domain.StatusRan {
-		t.Fatalf("unrelated package diagnostics contaminated method analysis: %#v", result.Methods[1])
+	if result.Methods[1].Status != domain.StatusInconclusive {
+		t.Fatalf("method analysis did not retain its sound repository-wide fallback: %#v", result.Methods[1])
 	}
 	if len(result.Targets) != 1 || result.Targets[0].Symbol != "Value.Adjust" {
 		t.Fatalf("changed method target is missing: %#v", result.Targets)
+	}
+}
+
+func TestParseRepositoryReportsMissingUnchangedSource(t *testing.T) {
+	repo := t.TempDir()
+	git(t, repo, "init", "-q")
+	git(t, repo, "config", "user.email", "simpleton@example.invalid")
+	git(t, repo, "config", "user.name", "Simpleton Test")
+	write(t, filepath.Join(repo, "go.mod"), "module example.invalid/missing\n\ngo 1.24\n")
+	write(t, filepath.Join(repo, "value.go"), "package missing\n\nfunc Value() int { return 1 }\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-qm", "sample")
+	revision := git(t, repo, "rev-parse", "HEAD")
+	repository, err := gitx.Open(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, _, err = parseRepository(context.Background(), repository, revision, []string{"go.mod", "value.go", "missing.go"}, map[string]bool{"value.go": true})
+	if err == nil || !strings.Contains(err.Error(), "missing.go") {
+		t.Fatalf("missing unchanged Go source was silently ignored: %v", err)
+	}
+}
+
+func TestAnalyzeRejectsSyntaxBrokenChangedFile(t *testing.T) {
+	repo := t.TempDir()
+	git(t, repo, "init", "-q")
+	git(t, repo, "config", "user.email", "simpleton@example.invalid")
+	git(t, repo, "config", "user.name", "Simpleton Test")
+	write(t, filepath.Join(repo, "go.mod"), "module example.invalid/broken\n\ngo 1.24\n")
+	write(t, filepath.Join(repo, "value.go"), "package broken\n\nfunc Value() int { return 1 }\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-qm", "base")
+	base := git(t, repo, "rev-parse", "HEAD")
+	write(t, filepath.Join(repo, "value.go"), "package broken\n\nfunc Value( {\n")
+	git(t, repo, "commit", "-qam", "candidate")
+	head := git(t, repo, "rev-parse", "HEAD")
+
+	_, err := (Handler{}).Analyze(context.Background(), packrpc.AnalyzeParams{
+		Repository: repo, BaseRevision: base, HeadRevision: head,
+		ChangedFiles: []gitx.ChangedFile{{Path: "value.go", Language: "go"}}, BudgetMS: 10_000,
+	})
+	if err == nil || !strings.Contains(err.Error(), "parse changed Go source value.go") {
+		t.Fatalf("syntax-broken changed file was reported as analyzed: %v", err)
 	}
 }
 
@@ -368,12 +478,13 @@ func TestModuleMetadataDerivesPackagePathsWithoutCompilingRepository(t *testing.
 	}
 }
 
-func TestParseRepositoryFallsBackPerPathAfterBatchFailure(t *testing.T) {
+func TestParseRepositoryFallsBackPerPathForLineBreakPath(t *testing.T) {
 	repo := t.TempDir()
 	git(t, repo, "init", "-q")
 	git(t, repo, "config", "user.email", "simpleton@example.invalid")
 	git(t, repo, "config", "user.name", "Simpleton Test")
 	write(t, filepath.Join(repo, "main.go"), "package sample\n\nfunc Example() {}\n")
+	write(t, filepath.Join(repo, "line\nbreak.go"), "package sample\n\nfunc LineBreak() {}\n")
 	git(t, repo, "add", ".")
 	git(t, repo, "commit", "-qm", "sample")
 	revision := git(t, repo, "rev-parse", "HEAD")
@@ -381,12 +492,12 @@ func TestParseRepositoryFallsBackPerPathAfterBatchFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	parsed, _, _, _, err := parseRepository(context.Background(), repository, revision, []string{"missing\n.go", "main.go"}, map[string]bool{"main.go": true})
+	parsed, _, _, _, err := parseRepository(context.Background(), repository, revision, []string{"line\nbreak.go", "main.go"}, map[string]bool{"main.go": true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed["main.go"] == nil {
-		t.Fatalf("valid blob was discarded after batch failure: %#v", parsed)
+	if parsed["main.go"] == nil || parsed["line\nbreak.go"] == nil {
+		t.Fatalf("valid per-path fallback blob was discarded: %#v", parsed)
 	}
 }
 

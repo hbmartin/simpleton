@@ -63,7 +63,10 @@ func sqliteFileURL(filename string) url.URL {
 		unc := strings.TrimPrefix(strings.ReplaceAll(filename, "\\", "/"), "//")
 		host, path, found := strings.Cut(unc, "/")
 		if found && host != "" {
-			return url.URL{Scheme: "file", Host: host, Path: "/" + path}
+			// SQLite accepts only an empty or localhost URI authority by default.
+			// Preserve the UNC server as the leading component of an authority-free
+			// //server/share path instead of emitting file://server/share.
+			return url.URL{Scheme: "file", Path: "//" + host + "/" + path}
 		}
 	}
 	return url.URL{Scheme: "file", Path: slashed}

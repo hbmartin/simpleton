@@ -158,7 +158,8 @@ func parseRepository(ctx context.Context, repo gitx.Repository, revision string,
 	if sources == nil {
 		sources = map[string][]byte{}
 	}
-	var fallbackFailures []error
+	var readFailures []error
+	var parseDiagnostics []string
 	for _, path := range goPaths {
 		if ctx.Err() != nil {
 			return nil, nil, nil, nil, ctx.Err()
@@ -168,23 +169,28 @@ func parseRepository(ctx context.Context, repo gitx.Repository, revision string,
 			var err error
 			source, err = repo.FileAt(ctx, revision, path)
 			if err != nil {
-				if batchErr != nil || changed[path] {
-					fallbackFailures = append(fallbackFailures, fmt.Errorf("read %s: %w", path, err))
-				}
+				readFailures = append(readFailures, fmt.Errorf("read %s: %w", path, err))
 				continue
 			}
 		}
 		file, err := parser.ParseFile(fset, path, source, parser.SkipObjectResolution)
 		if err != nil {
+			if changed[path] {
+				return nil, nil, nil, nil, fmt.Errorf("parse changed Go source %s: %w", path, err)
+			}
+			parseDiagnostics = append(parseDiagnostics, "parse "+path+": "+err.Error())
+			if file != nil {
+				parsed[path] = file
+			}
 			continue
 		}
 		parsed[path] = file
 	}
-	if len(fallbackFailures) > 0 {
+	if len(readFailures) > 0 {
 		if batchErr != nil {
-			return nil, nil, nil, nil, fmt.Errorf("batch-read Go sources: %w; fallback failures: %v", batchErr, errors.Join(fallbackFailures...))
+			return nil, nil, nil, nil, fmt.Errorf("batch-read Go sources: %w; fallback failures: %v", batchErr, errors.Join(readFailures...))
 		}
-		return nil, nil, nil, nil, errors.Join(fallbackFailures...)
+		return nil, nil, nil, nil, errors.Join(readFailures...)
 	}
 	metadata := loadPackageMetadata(ctx, repo, revision, paths)
 	if err := ctx.Err(); err != nil {
@@ -194,6 +200,9 @@ func parseRepository(ctx context.Context, repo gitx.Repository, revision string,
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
+	diagnostics = append(diagnostics, parseDiagnostics...)
+	slices.Sort(diagnostics)
+	diagnostics = slices.Compact(diagnostics)
 	return parsed, declarationKeys, callers, diagnostics, nil
 }
 
@@ -544,11 +553,11 @@ func relevantPackagePaths(packagePaths []string, packages map[string]*parsedPack
 	if len(changed) == 0 {
 		return slices.Clone(packagePaths)
 	}
-	// Interface-dispatched callers can depend only on an interface package and
-	// never import its implementation. Seed the reverse-import closure with
-	// packages that declare potentially relevant interfaces instead of
-	// type-checking the entire repository for every method-bearing changed file.
-	methodNames := map[string]bool{}
+	// Interface-dispatched callers can depend only on a standard-library,
+	// third-party, or repository interface and never import its implementation.
+	// There is no sound import-only closure for a changed method, so retain the
+	// repository-wide fallback. Free-function changes still use the narrower
+	// reverse-import closure below.
 	for _, group := range packages {
 		for index, file := range group.files {
 			if !changed[group.paths[index]] {
@@ -556,7 +565,7 @@ func relevantPackagePaths(packagePaths []string, packages map[string]*parsedPack
 			}
 			for _, declaration := range file.Decls {
 				if function, ok := declaration.(*ast.FuncDecl); ok && function.Recv != nil {
-					methodNames[function.Name.Name] = true
+					return slices.Clone(packagePaths)
 				}
 			}
 		}
@@ -574,9 +583,6 @@ func relevantPackagePaths(packagePaths []string, packages map[string]*parsedPack
 				if err == nil && packages[importPath] != nil {
 					importers[importPath] = append(importers[importPath], packagePath)
 				}
-			}
-			if len(methodNames) > 0 && declaresInterfaceMethod(file, methodNames) {
-				selected[packagePath] = true
 			}
 		}
 	}
@@ -603,29 +609,6 @@ func relevantPackagePaths(packagePaths []string, packages map[string]*parsedPack
 		}
 	}
 	return result
-}
-
-func declaresInterfaceMethod(file *ast.File, methodNames map[string]bool) bool {
-	found := false
-	ast.Inspect(file, func(node ast.Node) bool {
-		if found {
-			return false
-		}
-		interfaceType, ok := node.(*ast.InterfaceType)
-		if !ok {
-			return true
-		}
-		for _, field := range interfaceType.Methods.List {
-			for _, name := range field.Names {
-				if methodNames[name.Name] {
-					found = true
-					return false
-				}
-			}
-		}
-		return true
-	})
-	return found
 }
 
 func calledFunctions(info *types.Info, expression ast.Expr, receiverTypes []types.Type, implementingTypesByInterface map[*types.Interface][]types.Type) []*types.Func {

@@ -12,9 +12,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -475,8 +477,22 @@ func retryableFilesystemError(err error) bool {
 	if errors.Is(err, errFileChangedWhileHashing) || errors.Is(err, os.ErrNotExist) {
 		return true
 	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) && retryableFilesystemErrno(errno, runtime.GOOS) {
+		return true
+	}
 	var temporary interface{ Temporary() bool }
 	return errors.As(err, &temporary) && temporary.Temporary()
+}
+
+func retryableFilesystemErrno(errno syscall.Errno, goos string) bool {
+	if errno == syscall.ESTALE || errno == syscall.EIO {
+		return true
+	}
+	// ERROR_SHARING_VIOLATION is 32. Referring to it by value keeps this file
+	// portable because the syscall package does not export the Windows name on
+	// non-Windows builds.
+	return goos == "windows" && errno == syscall.Errno(32)
 }
 
 func pathsResolveEqual(left, right string) (bool, error) {
