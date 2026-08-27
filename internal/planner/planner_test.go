@@ -458,6 +458,21 @@ func TestManagedMethodResultDoesNotAliasLocalPointers(t *testing.T) {
 	}
 }
 
+func TestManagedEvidencePackDoesNotAliasAdvisoryCost(t *testing.T) {
+	cost := 2.5
+	pack := domain.EvidencePack{AdvisoryReview: domain.AdvisoryReview{
+		Status: domain.StatusRan, CostUSD: &cost,
+	}}
+	managed := managedEvidencePack(pack, "acme/repo", nil)
+	if managed.AdvisoryReview.CostUSD == pack.AdvisoryReview.CostUSD {
+		t.Fatalf("managed advisory cost aliases local evidence: local=%#v managed=%#v", pack.AdvisoryReview, managed.AdvisoryReview)
+	}
+	*managed.AdvisoryReview.CostUSD = 99
+	if *pack.AdvisoryReview.CostUSD != 2.5 {
+		t.Fatalf("mutating managed advisory cost changed local evidence: local=%#v managed=%#v", pack.AdvisoryReview, managed.AdvisoryReview)
+	}
+}
+
 func TestManagedRiskAllowlistCoversNormalizedPackVocabulary(t *testing.T) {
 	risks := []string{
 		"imports_fs", "imports_node_fs", "imports_http2", "imports_node_http2", "imports_timers", "imports_node_timers",
