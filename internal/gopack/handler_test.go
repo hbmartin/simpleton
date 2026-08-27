@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/build/constraint"
 	"go/parser"
 	"go/token"
 	"go/types"
@@ -441,7 +442,7 @@ func TestParseRepositoryDiagnosesMissingRelevantSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	parsed, _, _, diagnostics, err := parseRepository(context.Background(), repository, revision, []string{"go.mod", "value.go", "missing.go"}, map[string]bool{"value.go": true})
+	parsed, _, _, diagnostics, _, err := parseRepository(context.Background(), repository, revision, []string{"go.mod", "value.go", "missing.go"}, map[string]bool{"value.go": true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -465,7 +466,7 @@ func TestParseRepositoryDoesNotStoreSyntheticFilesAfterParseErrors(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	parsed, _, _, diagnostics, err := parseRepository(context.Background(), repository, revision, []string{"go.mod", "value.go", "broken.go"}, map[string]bool{"value.go": true})
+	parsed, _, _, diagnostics, _, err := parseRepository(context.Background(), repository, revision, []string{"go.mod", "value.go", "broken.go"}, map[string]bool{"value.go": true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -495,8 +496,37 @@ func TestAnalyzeReportsSyntaxBrokenChangedFileAsInconclusive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Targets) != 0 || result.Methods[1].Status != domain.StatusInconclusive || !strings.Contains(result.Methods[1].Reason, "parse value.go") {
+	if len(result.Targets) != 0 || result.Methods[0].Status != domain.StatusInconclusive || result.Methods[0].Coverage != nil ||
+		result.Methods[1].Status != domain.StatusInconclusive || !strings.Contains(result.Methods[1].Reason, "parse value.go") {
 		t.Fatalf("syntax-broken changed file did not produce a scoped inconclusive result: %#v", result)
+	}
+}
+
+func TestAnalyzeReportsParseFailureInSoleSourceOfUnchangedCaller(t *testing.T) {
+	repo := t.TempDir()
+	git(t, repo, "init", "-q")
+	git(t, repo, "config", "user.email", "simpleton@example.invalid")
+	git(t, repo, "config", "user.name", "Simpleton Test")
+	write(t, filepath.Join(repo, "go.mod"), "module example.invalid/brokencaller\n\ngo 1.24\n")
+	write(t, filepath.Join(repo, "dep", "value.go"), "package dep\n\nfunc Adjust(value int) int { return value }\n")
+	write(t, filepath.Join(repo, "caller", "caller.go"), "package caller\n\nimport \"example.invalid/brokencaller/dep\"\n\nfunc Public(value int) int { return dep.Adjust(value) }\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-qm", "base")
+	base := git(t, repo, "rev-parse", "HEAD")
+	write(t, filepath.Join(repo, "dep", "value.go"), "package dep\n\nfunc Adjust(value int) int { return value + 1 }\n")
+	write(t, filepath.Join(repo, "caller", "caller.go"), "package caller\n\nimport \"example.invalid/brokencaller/dep\"\n\nfunc Public(value int) int { return dep.Adjust( }\n")
+	git(t, repo, "commit", "-qam", "candidate")
+	head := git(t, repo, "rev-parse", "HEAD")
+
+	result, err := (Handler{}).Analyze(context.Background(), packrpc.AnalyzeParams{
+		Repository: repo, BaseRevision: base, HeadRevision: head,
+		ChangedFiles: []gitx.ChangedFile{{Path: "dep/value.go", Language: "go"}}, BudgetMS: 10_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Methods[1].Status != domain.StatusInconclusive || !strings.Contains(result.Methods[1].Reason, "parse caller/caller.go") {
+		t.Fatalf("broken sole-source caller package was silently pruned: %#v", result.Methods[1])
 	}
 }
 
@@ -535,13 +565,19 @@ func TestAnalyzeIgnoresChangedTestdataAndBuildExcludedSources(t *testing.T) {
 	git(t, repo, "config", "user.name", "Simpleton Test")
 	write(t, filepath.Join(repo, "go.mod"), "module example.invalid/ignored\n\ngo 1.24\n")
 	write(t, filepath.Join(repo, "main.go"), "package ignored\n\nfunc Main() {}\n")
-	write(t, filepath.Join(repo, "ignored.go"), "//go:build ignore\n\npackage ignored\n\nfunc Broken() {}\n")
+	write(t, filepath.Join(repo, "ignored.go"), "/* project license */\n//go:build ignore\n\npackage ignored\n\nfunc Broken() {}\n")
 	write(t, filepath.Join(repo, "testdata", "broken.go"), "package testdata\n\nfunc Broken() {}\n")
+	write(t, filepath.Join(repo, ".scratch", "broken.go"), "package scratch\n\nfunc Broken() {}\n")
+	write(t, filepath.Join(repo, "_examples", "broken.go"), "package examples\n\nfunc Broken() {}\n")
+	write(t, filepath.Join(repo, "vendor", "example.invalid", "dependency", "broken.go"), "package dependency\n\nfunc Broken() {}\n")
 	git(t, repo, "add", ".")
 	git(t, repo, "commit", "-qm", "base")
 	base := git(t, repo, "rev-parse", "HEAD")
-	write(t, filepath.Join(repo, "ignored.go"), "//go:build ignore\n\npackage ignored\n\nfunc Broken(\n")
+	write(t, filepath.Join(repo, "ignored.go"), "/* project license */\n//go:build ignore\n\npackage ignored\n\nfunc Broken(\n")
 	write(t, filepath.Join(repo, "testdata", "broken.go"), "this is intentionally malformed\n")
+	write(t, filepath.Join(repo, ".scratch", "broken.go"), "this is intentionally malformed\n")
+	write(t, filepath.Join(repo, "_examples", "broken.go"), "this is intentionally malformed\n")
+	write(t, filepath.Join(repo, "vendor", "example.invalid", "dependency", "broken.go"), "this is intentionally malformed\n")
 	git(t, repo, "commit", "-qam", "candidate")
 	head := git(t, repo, "rev-parse", "HEAD")
 
@@ -550,13 +586,17 @@ func TestAnalyzeIgnoresChangedTestdataAndBuildExcludedSources(t *testing.T) {
 		ChangedFiles: []gitx.ChangedFile{
 			{Path: "ignored.go", Language: "go"},
 			{Path: "testdata/broken.go", Language: "go"},
+			{Path: ".scratch/broken.go", Language: "go"},
+			{Path: "_examples/broken.go", Language: "go"},
+			{Path: "vendor/example.invalid/dependency/broken.go", Language: "go"},
 		},
 		BudgetMS: 10_000,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Methods[1].Status != domain.StatusRan || len(result.Targets) != 0 {
+	if result.Methods[0].Status != domain.StatusRan || result.Methods[0].Coverage != nil || result.Methods[0].Reason != "no eligible changed Go sources" ||
+		result.Methods[1].Status != domain.StatusRan || len(result.Targets) != 0 {
 		t.Fatalf("excluded Go sources affected analysis: %#v", result)
 	}
 }
@@ -567,11 +607,12 @@ func TestAnalyzeIncludesChangedPlatformSpecificSource(t *testing.T) {
 	git(t, repo, "config", "user.email", "simpleton@example.invalid")
 	git(t, repo, "config", "user.name", "Simpleton Test")
 	write(t, filepath.Join(repo, "go.mod"), "module example.invalid/platform\n\ngo 1.24\n")
-	write(t, filepath.Join(repo, "value_windows.go"), "package platform\n\nfunc Value() int { return 1 }\n")
+	write(t, filepath.Join(repo, "value_linux.go"), "//go:build linux\n\npackage platform\n\nfunc Value() int { return 1 }\n")
+	write(t, filepath.Join(repo, "value_windows.go"), "//go:build windows\n\npackage platform\n\nfunc Value() int { return 1 }\n")
 	git(t, repo, "add", ".")
 	git(t, repo, "commit", "-qm", "base")
 	base := git(t, repo, "rev-parse", "HEAD")
-	write(t, filepath.Join(repo, "value_windows.go"), "package platform\n\nfunc Value() int { return 2 }\n")
+	write(t, filepath.Join(repo, "value_windows.go"), "//go:build windows\n\npackage platform\n\nfunc Value() int { return 2 }\n")
 	git(t, repo, "commit", "-qam", "candidate")
 	head := git(t, repo, "rev-parse", "HEAD")
 
@@ -582,8 +623,74 @@ func TestAnalyzeIncludesChangedPlatformSpecificSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Targets) != 1 || result.Targets[0].Symbol != "Value" {
+	if len(result.Targets) != 1 || result.Targets[0].Symbol != "Value" || result.Methods[1].Status != domain.StatusRan {
 		t.Fatalf("platform-specific changed source was skipped: %#v", result)
+	}
+}
+
+func TestAnalyzeSeparatesBuildTaggedImplementations(t *testing.T) {
+	repo := t.TempDir()
+	git(t, repo, "init", "-q")
+	git(t, repo, "config", "user.email", "simpleton@example.invalid")
+	git(t, repo, "config", "user.name", "Simpleton Test")
+	write(t, filepath.Join(repo, "go.mod"), "module example.invalid/tagged\n\ngo 1.24\n")
+	write(t, filepath.Join(repo, "value_posix.go"), "//go:build !windows\n\npackage tagged\n\nfunc Value() int { return 1 }\n")
+	write(t, filepath.Join(repo, "value_nt.go"), "//go:build windows\n\npackage tagged\n\nfunc Value() int { return 1 }\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-qm", "base")
+	base := git(t, repo, "rev-parse", "HEAD")
+	write(t, filepath.Join(repo, "value_nt.go"), "//go:build windows\n\npackage tagged\n\nfunc Value() int { return 2 }\n")
+	git(t, repo, "commit", "-qam", "candidate")
+	head := git(t, repo, "rev-parse", "HEAD")
+
+	result, err := (Handler{}).Analyze(context.Background(), packrpc.AnalyzeParams{
+		Repository: repo, BaseRevision: base, HeadRevision: head,
+		ChangedFiles: []gitx.ChangedFile{{Path: "value_nt.go", Language: "go"}}, BudgetMS: 10_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Targets) != 1 || result.Targets[0].Symbol != "Value" || result.Methods[1].Status != domain.StatusRan {
+		t.Fatalf("mutually exclusive build-tagged implementations were coalesced: %#v", result)
+	}
+}
+
+func TestAnalyzeMergesCallersAcrossCompatiblePlatformProfiles(t *testing.T) {
+	repo := t.TempDir()
+	git(t, repo, "init", "-q")
+	git(t, repo, "config", "user.email", "simpleton@example.invalid")
+	git(t, repo, "config", "user.name", "Simpleton Test")
+	write(t, filepath.Join(repo, "go.mod"), "module example.invalid/platformcallers\n\ngo 1.24\n")
+	write(t, filepath.Join(repo, "dep", "value.go"), "package dep\n\ntype Value struct{}\nfunc (Value) Adjust(value int) int { return value }\n")
+	write(t, filepath.Join(repo, "caller", "caller_linux.go"), "package caller\n\nimport \"example.invalid/platformcallers/dep\"\nfunc Linux(value int) int { return (dep.Value{}).Adjust(value) }\n")
+	write(t, filepath.Join(repo, "caller", "caller_windows.go"), "package caller\n\nimport \"example.invalid/platformcallers/dep\"\nfunc Windows(value int) int { return (dep.Value{}).Adjust(value) }\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-qm", "base")
+	base := git(t, repo, "rev-parse", "HEAD")
+	write(t, filepath.Join(repo, "dep", "value.go"), "package dep\n\ntype Value struct{}\nfunc (Value) Adjust(value int) int { return value + 1 }\n")
+	git(t, repo, "commit", "-qam", "candidate")
+	head := git(t, repo, "rev-parse", "HEAD")
+
+	result, err := (Handler{}).Analyze(context.Background(), packrpc.AnalyzeParams{
+		Repository: repo, BaseRevision: base, HeadRevision: head,
+		ChangedFiles: []gitx.ChangedFile{{Path: "dep/value.go", Language: "go"}}, BudgetMS: 10_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertUnchangedCaller(t, result, "Value.Adjust", "caller/caller_linux.go", "Linux")
+	assertUnchangedCaller(t, result, "Value.Adjust", "caller/caller_windows.go", "Windows")
+}
+
+func TestBuildProfileSearchBacktracksAcrossCustomTags(t *testing.T) {
+	expression, err := constraint.Parse("//go:build (first || second) && !first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := goSource{path: "value.go", constraint: expression}
+	profile, ok := profileForSources([]goSource{source})
+	if !ok || !source.matches(profile) || profile.tags["first"] || !profile.tags["second"] {
+		t.Fatalf("build profile search did not backtrack to a satisfying tag assignment: profile=%#v ok=%t", profile, ok)
 	}
 }
 
@@ -632,7 +739,7 @@ func TestParseRepositoryFallsBackPerPathForLineBreakPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	parsed, _, _, _, err := parseRepository(context.Background(), repository, revision, []string{"line\nbreak.go", "main.go"}, map[string]bool{"main.go": true})
+	parsed, _, _, _, _, err := parseRepository(context.Background(), repository, revision, []string{"line\nbreak.go", "main.go"}, map[string]bool{"main.go": true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -653,7 +760,7 @@ func TestParseRepositoryReportsBatchAndFallbackReadFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, _, err = parseRepository(context.Background(), repository, "HEAD\ninvalid", []string{"main.go"}, map[string]bool{"main.go": true})
+	_, _, _, _, _, err = parseRepository(context.Background(), repository, "HEAD\ninvalid", []string{"main.go"}, map[string]bool{"main.go": true})
 	if err == nil || !strings.Contains(err.Error(), "batch-read Go sources") || !strings.Contains(err.Error(), "fallback failures") {
 		t.Fatalf("hard repository read failure was not reported: %v", err)
 	}

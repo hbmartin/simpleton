@@ -68,6 +68,21 @@ test("gives anonymous default class methods a collision-free scope", async (t) =
   assert.equal(new Set(targets.map((target) => target.id)).size, 2);
 });
 
+test("gives multiple anonymous class expressions distinct indexed scopes", async (t) => {
+  const { repo, revision } = await repository(t, {
+    "sample.ts": "declare function consume(value: unknown): void;\nconsume(class { same() { return 1; } });\nconsume(class { same() { return 2; } });\n",
+  });
+  const responses = await runPack([
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocol_version: "1" } },
+    { jsonrpc: "2.0", id: 2, method: "analyze", params: {
+      repository: repo, head_revision: revision, changed_files: [{ path: "sample.ts", language: "typescript" }], budget_ms: 1000,
+    } },
+  ]);
+  const targets = responses[1].result.targets.filter((target) => target.symbol.endsWith(".same"));
+  assert.deepEqual(new Set(targets.map((target) => target.symbol)), new Set(["AnonymousClass0.same", "AnonymousClass1.same"]));
+  assert.equal(new Set(targets.map((target) => target.id)).size, 2);
+});
+
 test("keeps anonymous class identities stable when preceding text shifts", async (t) => {
   const { repo, revision: firstRevision } = await repository(t, {
     "sample.ts": "declare function consume(value: unknown): void;\nconsume(class { run() { return 1; } });\n",

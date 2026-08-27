@@ -940,7 +940,7 @@ func managedEvidencePack(pack domain.EvidencePack, repositoryIdentity string, re
 			Status:     managedMethodStatus(pack.AdvisoryReview.Status),
 			Suspicion:  managedEnum(pack.AdvisoryReview.Suspicion, "low", "medium", "high"),
 			DurationMS: pack.AdvisoryReview.DurationMS,
-			CostUSD:    pack.AdvisoryReview.CostUSD,
+			CostUSD:    cloneFloat64(pack.AdvisoryReview.CostUSD),
 		},
 		Telemetry: domain.TelemetryOutcome{
 			Status:        managedEnum(pack.Telemetry.Status, "not_uploaded", "uploaded", "upload_failed"),
