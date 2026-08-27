@@ -20,6 +20,8 @@ import (
 
 const filesystemRetryDelay = 10 * time.Millisecond
 
+var errFileChangedWhileHashing = errors.New("file changed while it was being hashed")
+
 type ChangedFile struct {
 	Status   string `json:"status"`
 	Path     string `json:"path"`
@@ -365,6 +367,9 @@ func digestRegularFile(ctx context.Context, path string, maxBytes int64) ([]byte
 		if ctx.Err() != nil {
 			return nil, 0, ctx.Err()
 		}
+		if !retryableFilesystemError(err) {
+			return nil, 0, err
+		}
 		lastErr = err
 		if attempt < 2 {
 			if err := waitForFilesystemRetry(ctx); err != nil {
@@ -415,7 +420,7 @@ func digestRegularFileOnce(ctx context.Context, path string, maxBytes int64) ([]
 		return nil, 0, err
 	}
 	if total != before.Size() || after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime()) {
-		return nil, 0, errors.New("file changed while it was being hashed")
+		return nil, 0, errFileChangedWhileHashing
 	}
 	return hash.Sum(nil), total, nil
 }
@@ -429,6 +434,9 @@ func lstatWithRetry(ctx context.Context, path string) (os.FileInfo, error) {
 		info, err := os.Lstat(path)
 		if err == nil {
 			return info, nil
+		}
+		if !retryableFilesystemError(err) {
+			return nil, err
 		}
 		lastErr = err
 		if attempt < 2 {
@@ -450,6 +458,9 @@ func readlinkWithRetry(ctx context.Context, path string) (string, error) {
 		if err == nil {
 			return target, nil
 		}
+		if !retryableFilesystemError(err) {
+			return "", err
+		}
 		lastErr = err
 		if attempt < 2 {
 			if err := waitForFilesystemRetry(ctx); err != nil {
@@ -458,6 +469,14 @@ func readlinkWithRetry(ctx context.Context, path string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("readlink failed after 3 attempts: %w", lastErr)
+}
+
+func retryableFilesystemError(err error) bool {
+	if errors.Is(err, errFileChangedWhileHashing) || errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+	var temporary interface{ Temporary() bool }
+	return errors.As(err, &temporary) && temporary.Temporary()
 }
 
 func pathsResolveEqual(left, right string) (bool, error) {

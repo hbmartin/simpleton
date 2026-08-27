@@ -220,7 +220,8 @@ function isClassLike(node) {
 function className(node) {
   if (node.name && ts.isIdentifier(node.name)) return node.name.text;
   if (node.parent && ts.isVariableDeclaration(node.parent) && ts.isIdentifier(node.parent.name)) return node.parent.name.text;
-  return "";
+  if (ts.isClassDeclaration(node) && node.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword)) return "default";
+  return `AnonymousClass${node.pos}`;
 }
 
 function functionName(node) {

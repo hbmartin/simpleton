@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -19,6 +20,27 @@ func TestOpenAcceptsRelativeRoot(t *testing.T) {
 	defer func() { _ = state.Close() }()
 	if _, err := os.Stat(filepath.Join("relative", "state", "simpleton.db")); err != nil {
 		t.Fatalf("relative database path was not created: %v", err)
+	}
+}
+
+func TestSQLiteFileURLHandlesWindowsPaths(t *testing.T) {
+	tests := []struct {
+		filename string
+		host     string
+		path     string
+	}{
+		{filename: `C:\state dir\simpleton.db`, path: "/C:/state dir/simpleton.db"},
+		{filename: `\\server\share\simpleton.db`, host: "server", path: "/share/simpleton.db"},
+	}
+	for _, test := range tests {
+		databaseURL := sqliteFileURL(test.filename)
+		parsed, err := url.Parse(databaseURL.String())
+		if err != nil {
+			t.Fatalf("parse SQLite URL for %q: %v", test.filename, err)
+		}
+		if parsed.Scheme != "file" || parsed.Host != test.host || parsed.Path != test.path {
+			t.Fatalf("invalid SQLite URL for %q: %s", test.filename, databaseURL.String())
+		}
 	}
 }
 
