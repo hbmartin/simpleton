@@ -122,8 +122,16 @@ func TestRetryableFilesystemErrorsIncludeNetworkAndWindowsTransientFailures(t *t
 			t.Fatalf("transient filesystem error was not retryable: %v", err)
 		}
 	}
-	if !retryableFilesystemErrno(syscall.Errno(32), "windows") {
-		t.Fatal("Windows sharing violation was not retryable")
+	for _, errno := range []syscall.Errno{32, 33, 54, 59, 64, 121, 1237} {
+		if !retryableFilesystemErrno(errno, "windows") {
+			t.Fatalf("Windows transient error %d was not retryable", errno)
+		}
+	}
+	if retryableFilesystemErrno(syscall.ESTALE, "windows") || retryableFilesystemErrno(syscall.EIO, "windows") {
+		t.Fatal("synthetic Unix errno was treated as a native Windows filesystem error")
+	}
+	if !retryableFilesystemErrno(syscall.ESTALE, "linux") || !retryableFilesystemErrno(syscall.EIO, "darwin") {
+		t.Fatal("Unix network filesystem errors were not retryable")
 	}
 	if retryableFilesystemErrno(syscall.EINVAL, "linux") {
 		t.Fatal("deterministic invalid-argument failure was retryable")

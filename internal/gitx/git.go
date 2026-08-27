@@ -486,13 +486,24 @@ func retryableFilesystemError(err error) bool {
 }
 
 func retryableFilesystemErrno(errno syscall.Errno, goos string) bool {
-	if errno == syscall.ESTALE || errno == syscall.EIO {
-		return true
+	if goos == "windows" {
+		// Windows file APIs return native Win32 error numbers. The syscall
+		// package's ESTALE and EIO values are synthetic on Windows and cannot
+		// match errors returned by those APIs.
+		switch errno {
+		case syscall.Errno(32), // ERROR_SHARING_VIOLATION
+			syscall.Errno(33),   // ERROR_LOCK_VIOLATION
+			syscall.Errno(54),   // ERROR_NETWORK_BUSY
+			syscall.Errno(59),   // ERROR_UNEXP_NET_ERR
+			syscall.Errno(64),   // ERROR_NETNAME_DELETED
+			syscall.Errno(121),  // ERROR_SEM_TIMEOUT
+			syscall.Errno(1237): // ERROR_RETRY
+			return true
+		default:
+			return false
+		}
 	}
-	// ERROR_SHARING_VIOLATION is 32. Referring to it by value keeps this file
-	// portable because the syscall package does not export the Windows name on
-	// non-Windows builds.
-	return goos == "windows" && errno == syscall.Errno(32)
+	return errno == syscall.ESTALE || errno == syscall.EIO
 }
 
 func pathsResolveEqual(left, right string) (bool, error) {
