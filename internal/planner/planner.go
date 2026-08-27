@@ -1125,13 +1125,29 @@ func managedMethodResult(method domain.MethodResult, review bool) domain.MethodR
 	}
 	managed := domain.MethodResult{
 		ID: id, Language: managedLanguage(method.Language), Status: managedMethodStatus(method.Status),
-		Budget: managedDuration(method.Budget), DurationMS: method.DurationMS, CostUSD: method.CostUSD,
-		Coverage: method.Coverage, Findings: findings,
+		Budget: managedDuration(method.Budget), DurationMS: method.DurationMS, CostUSD: cloneFloat64(method.CostUSD),
+		Coverage: cloneCoverage(method.Coverage), Findings: findings,
 	}
 	if method.Applicability != nil {
 		managed.Applicability = &domain.RunApplicability{Applicable: method.Applicability.Applicable, Confidence: method.Applicability.Confidence}
 	}
 	return managed
+}
+
+func cloneCoverage(coverage *domain.Coverage) *domain.Coverage {
+	if coverage == nil {
+		return nil
+	}
+	copy := *coverage
+	return &copy
+}
+
+func cloneFloat64(value *float64) *float64 {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 func managedFindings(findings []domain.Finding) []domain.Finding {

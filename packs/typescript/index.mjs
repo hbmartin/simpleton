@@ -235,7 +235,7 @@ function className(node) {
     visit(source);
     indexedClassSources.add(source);
   }
-  return anonymousClassNames.get(node) ?? "AnonymousClass";
+  return anonymousClassNames.get(node) ?? `AnonymousClass${node.pos}`;
 }
 
 function explicitClassName(node) {

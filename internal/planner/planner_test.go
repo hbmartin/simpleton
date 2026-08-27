@@ -438,6 +438,26 @@ func TestManagedReviewPayloadPreservesAllowlistedSemantics(t *testing.T) {
 	}
 }
 
+func TestManagedMethodResultDoesNotAliasLocalPointers(t *testing.T) {
+	cost := 1.25
+	method := domain.MethodResult{
+		ID: "go_type_analysis",
+		Coverage: &domain.Coverage{
+			TargetsTotal: 4, TargetsObserved: 3, Ratio: 0.75,
+		},
+		CostUSD: &cost,
+	}
+	managed := managedMethodResult(method, true)
+	if managed.Coverage == method.Coverage || managed.CostUSD == method.CostUSD {
+		t.Fatalf("managed method result aliases local pointers: local=%#v managed=%#v", method, managed)
+	}
+	managed.Coverage.TargetsObserved = 0
+	*managed.CostUSD = 99
+	if method.Coverage.TargetsObserved != 3 || *method.CostUSD != 1.25 {
+		t.Fatalf("mutating managed result changed local evidence: local=%#v managed=%#v", method, managed)
+	}
+}
+
 func TestManagedRiskAllowlistCoversNormalizedPackVocabulary(t *testing.T) {
 	risks := []string{
 		"imports_fs", "imports_node_fs", "imports_http2", "imports_node_http2", "imports_timers", "imports_node_timers",

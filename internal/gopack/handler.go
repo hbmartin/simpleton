@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/build/constraint"
 	"go/importer"
 	"go/parser"
 	"go/token"
@@ -144,12 +145,17 @@ type caller struct {
 	Symbol string
 }
 
+type sourceDiagnostic struct {
+	path    string
+	message string
+}
+
 func parseRepository(ctx context.Context, repo gitx.Repository, revision string, paths []string, changed map[string]bool) (map[string]*ast.File, map[*ast.FuncDecl]string, map[string][]caller, []string, error) {
 	fset := token.NewFileSet()
 	parsed := map[string]*ast.File{}
 	goPaths := make([]string, 0)
 	for _, path := range paths {
-		if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+		if !goSourceCandidate(path) {
 			continue
 		}
 		goPaths = append(goPaths, path)
@@ -158,8 +164,8 @@ func parseRepository(ctx context.Context, repo gitx.Repository, revision string,
 	if sources == nil {
 		sources = map[string][]byte{}
 	}
-	var readFailures []error
-	var parseDiagnostics []string
+	var fallbackFailures []error
+	var sourceDiagnostics []sourceDiagnostic
 	for _, path := range goPaths {
 		if ctx.Err() != nil {
 			return nil, nil, nil, nil, ctx.Err()
@@ -169,41 +175,139 @@ func parseRepository(ctx context.Context, repo gitx.Repository, revision string,
 			var err error
 			source, err = repo.FileAt(ctx, revision, path)
 			if err != nil {
-				readFailures = append(readFailures, fmt.Errorf("read %s: %w", path, err))
+				failure := fmt.Errorf("read %s: %w", path, err)
+				if batchErr != nil {
+					fallbackFailures = append(fallbackFailures, failure)
+				} else {
+					sourceDiagnostics = append(sourceDiagnostics, sourceDiagnostic{path: path, message: failure.Error()})
+				}
 				continue
 			}
+			sources[path] = source
+		}
+		excluded, err := excludedByBuildConstraints(source)
+		if err != nil {
+			sourceDiagnostics = append(sourceDiagnostics, sourceDiagnostic{path: path, message: "build constraints " + path + ": " + err.Error()})
+			continue
+		}
+		if excluded {
+			continue
 		}
 		file, err := parser.ParseFile(fset, path, source, parser.SkipObjectResolution)
 		if err != nil {
-			if changed[path] {
-				return nil, nil, nil, nil, fmt.Errorf("parse changed Go source %s: %w", path, err)
-			}
-			parseDiagnostics = append(parseDiagnostics, "parse "+path+": "+err.Error())
-			if file != nil {
-				parsed[path] = file
-			}
+			sourceDiagnostics = append(sourceDiagnostics, sourceDiagnostic{path: path, message: "parse " + path + ": " + err.Error()})
 			continue
 		}
 		parsed[path] = file
 	}
-	if len(readFailures) > 0 {
-		if batchErr != nil {
-			return nil, nil, nil, nil, fmt.Errorf("batch-read Go sources: %w; fallback failures: %v", batchErr, errors.Join(readFailures...))
-		}
-		return nil, nil, nil, nil, errors.Join(readFailures...)
+	if len(fallbackFailures) > 0 {
+		return nil, nil, nil, nil, fmt.Errorf("batch-read Go sources: %w; fallback failures: %v", batchErr, errors.Join(fallbackFailures...))
 	}
 	metadata := loadPackageMetadata(ctx, repo, revision, paths)
 	if err := ctx.Err(); err != nil {
 		return nil, nil, nil, nil, err
 	}
-	declarationKeys, callers, diagnostics, err := typeCheck(ctx, fset, parsed, metadata, changed)
+	methodNames := changedFileMethodNames(parsed, changed)
+	declarationKeys, callers, diagnostics, checkedDirectories, err := typeCheck(ctx, fset, parsed, metadata, changed, methodNames)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	diagnostics = append(diagnostics, parseDiagnostics...)
+	for _, diagnostic := range sourceDiagnostics {
+		if changed[diagnostic.path] || checkedDirectories[filepath.Dir(diagnostic.path)] {
+			diagnostics = append(diagnostics, diagnostic.message)
+		}
+	}
 	slices.Sort(diagnostics)
 	diagnostics = slices.Compact(diagnostics)
 	return parsed, declarationKeys, callers, diagnostics, nil
+}
+
+func goSourceCandidate(path string) bool {
+	if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+		return false
+	}
+	base := filepath.Base(path)
+	if strings.HasPrefix(base, ".") || strings.HasPrefix(base, "_") {
+		return false
+	}
+	for _, part := range strings.Split(filepath.ToSlash(path), "/") {
+		if part == "testdata" {
+			return false
+		}
+	}
+	return true
+}
+
+func excludedByBuildConstraints(source []byte) (bool, error) {
+	var goBuild constraint.Expr
+	var plusBuild []constraint.Expr
+	for _, rawLine := range strings.Split(string(source), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		if constraint.IsGoBuild(line) {
+			if goBuild != nil {
+				return false, errors.New("multiple //go:build constraints")
+			}
+			expression, err := constraint.Parse(line)
+			if err != nil {
+				return false, err
+			}
+			goBuild = expression
+			continue
+		}
+		if constraint.IsPlusBuild(line) {
+			expression, err := constraint.Parse(line)
+			if err != nil {
+				return false, err
+			}
+			plusBuild = append(plusBuild, expression)
+			continue
+		}
+		if strings.HasPrefix(line, "//") {
+			continue
+		}
+		break
+	}
+	if goBuild != nil {
+		return requiresIgnoreTag(goBuild), nil
+	}
+	for _, expression := range plusBuild {
+		if requiresIgnoreTag(expression) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func requiresIgnoreTag(expression constraint.Expr) bool {
+	switch expression := expression.(type) {
+	case *constraint.TagExpr:
+		return expression.Tag == "ignore"
+	case *constraint.AndExpr:
+		return requiresIgnoreTag(expression.X) || requiresIgnoreTag(expression.Y)
+	case *constraint.OrExpr:
+		return requiresIgnoreTag(expression.X) && requiresIgnoreTag(expression.Y)
+	default:
+		return false
+	}
+}
+
+func changedFileMethodNames(parsed map[string]*ast.File, changed map[string]bool) map[string]bool {
+	result := map[string]bool{}
+	for path := range changed {
+		file := parsed[path]
+		if file == nil {
+			continue
+		}
+		for _, declaration := range file.Decls {
+			if function, ok := declaration.(*ast.FuncDecl); ok && function.Recv != nil {
+				result[function.Name.Name] = true
+			}
+		}
+	}
+	return result
 }
 
 type packageMetadata struct {
@@ -330,6 +434,7 @@ type typeCheckResult struct {
 	declarationKeys map[*ast.FuncDecl]string
 	callers         map[string][]caller
 	diagnostics     []string
+	checkedDirs     map[string]bool
 	err             error
 }
 
@@ -388,28 +493,28 @@ func (r *repositoryImporter) check(path string, group *parsedPackage) (*types.Pa
 	return group.types, group.checkError
 }
 
-func typeCheck(ctx context.Context, fset *token.FileSet, parsed map[string]*ast.File, metadata packageMetadata, changed map[string]bool) (map[*ast.FuncDecl]string, map[string][]caller, []string, error) {
-	return typeCheckWithImporter(ctx, fset, parsed, metadata, changed, importer.ForCompiler(fset, "source", nil))
+func typeCheck(ctx context.Context, fset *token.FileSet, parsed map[string]*ast.File, metadata packageMetadata, changed map[string]bool, methodNames map[string]bool) (map[*ast.FuncDecl]string, map[string][]caller, []string, map[string]bool, error) {
+	return typeCheckWithImporter(ctx, fset, parsed, metadata, changed, methodNames, importer.ForCompiler(fset, "source", nil))
 }
 
-func typeCheckWithImporter(ctx context.Context, fset *token.FileSet, parsed map[string]*ast.File, metadata packageMetadata, changed map[string]bool, fallback types.Importer) (map[*ast.FuncDecl]string, map[string][]caller, []string, error) {
+func typeCheckWithImporter(ctx context.Context, fset *token.FileSet, parsed map[string]*ast.File, metadata packageMetadata, changed map[string]bool, methodNames map[string]bool, fallback types.Importer) (map[*ast.FuncDecl]string, map[string][]caller, []string, map[string]bool, error) {
 	completed := make(chan typeCheckResult, 1)
 	go func() {
-		declarationKeys, callers, diagnostics, err := typeCheckSynchronously(ctx, fset, parsed, metadata, changed, fallback)
-		completed <- typeCheckResult{declarationKeys: declarationKeys, callers: callers, diagnostics: diagnostics, err: err}
+		declarationKeys, callers, diagnostics, checkedDirs, err := typeCheckSynchronously(ctx, fset, parsed, metadata, changed, methodNames, fallback)
+		completed <- typeCheckResult{declarationKeys: declarationKeys, callers: callers, diagnostics: diagnostics, checkedDirs: checkedDirs, err: err}
 	}()
 	select {
 	case <-ctx.Done():
-		return nil, nil, nil, ctx.Err()
+		return nil, nil, nil, nil, ctx.Err()
 	case result := <-completed:
 		if err := ctx.Err(); err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
-		return result.declarationKeys, result.callers, result.diagnostics, result.err
+		return result.declarationKeys, result.callers, result.diagnostics, result.checkedDirs, result.err
 	}
 }
 
-func typeCheckSynchronously(ctx context.Context, fset *token.FileSet, parsed map[string]*ast.File, metadata packageMetadata, changed map[string]bool, fallback types.Importer) (map[*ast.FuncDecl]string, map[string][]caller, []string, error) {
+func typeCheckSynchronously(ctx context.Context, fset *token.FileSet, parsed map[string]*ast.File, metadata packageMetadata, changed map[string]bool, methodNames map[string]bool, fallback types.Importer) (map[*ast.FuncDecl]string, map[string][]caller, []string, map[string]bool, error) {
 	groups := map[string]*parsedPackage{}
 	paths := make([]string, 0, len(parsed))
 	for path := range parsed {
@@ -444,18 +549,18 @@ func typeCheckSynchronously(ctx context.Context, fset *token.FileSet, parsed map
 		packagePaths = append(packagePaths, packagePath)
 	}
 	slices.Sort(packagePaths)
-	relevantPaths := relevantPackagePaths(packagePaths, packages, changed)
+	relevantPaths := relevantPackagePaths(packagePaths, packages, changed, methodNames)
 	checker := &repositoryImporter{
 		ctx: ctx, fset: fset, packages: packages,
 		fallback: fallback, diagnostics: &diagnostics,
 	}
 	for _, packagePath := range relevantPaths {
 		if err := ctx.Err(); err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		_, _ = checker.check(packagePath, packages[packagePath])
 		if err := ctx.Err(); err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 	}
 	checkedPaths := make([]string, 0, len(packagePaths))
@@ -467,7 +572,7 @@ func typeCheckSynchronously(ctx context.Context, fset *token.FileSet, parsed map
 	receiverTypes := make([]types.Type, 0)
 	for _, packagePath := range checkedPaths {
 		if err := ctx.Err(); err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		group := packages[packagePath]
 		for _, name := range group.types.Scope().Names() {
@@ -501,7 +606,7 @@ func typeCheckSynchronously(ctx context.Context, fset *token.FileSet, parsed map
 	implementingTypesByInterface := map[*types.Interface][]types.Type{}
 	for _, packagePath := range checkedPaths {
 		if err := ctx.Err(); err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		group := packages[packagePath]
 		for index, file := range group.files {
@@ -531,7 +636,7 @@ func typeCheckSynchronously(ctx context.Context, fset *token.FileSet, parsed map
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	slices.Sort(diagnostics)
 	diagnostics = slices.Compact(diagnostics)
@@ -546,37 +651,33 @@ func typeCheckSynchronously(ctx context.Context, fset *token.FileSet, parsed map
 			return left.Path == right.Path && left.Symbol == right.Symbol
 		})
 	}
-	return declarationKeys, callers, diagnostics, nil
+	checkedDirectories := map[string]bool{}
+	for _, packagePath := range checkedPaths {
+		for _, path := range packages[packagePath].paths {
+			checkedDirectories[filepath.Dir(path)] = true
+		}
+	}
+	return declarationKeys, callers, diagnostics, checkedDirectories, nil
 }
 
-func relevantPackagePaths(packagePaths []string, packages map[string]*parsedPackage, changed map[string]bool) []string {
+func relevantPackagePaths(packagePaths []string, packages map[string]*parsedPackage, changed map[string]bool, methodNames map[string]bool) []string {
 	if len(changed) == 0 {
 		return slices.Clone(packagePaths)
 	}
-	// Interface-dispatched callers can depend only on a standard-library,
-	// third-party, or repository interface and never import its implementation.
-	// There is no sound import-only closure for a changed method, so retain the
-	// repository-wide fallback. Free-function changes still use the narrower
-	// reverse-import closure below.
-	for _, group := range packages {
-		for index, file := range group.files {
-			if !changed[group.paths[index]] {
-				continue
-			}
-			for _, declaration := range file.Decls {
-				if function, ok := declaration.(*ast.FuncDecl); ok && function.Recv != nil {
-					return slices.Clone(packagePaths)
-				}
-			}
-		}
-	}
 	selected := map[string]bool{}
+	methodCandidates := map[string]bool{}
 	importers := make(map[string][]string, len(packages))
 	for _, packagePath := range packagePaths {
 		group := packages[packagePath]
 		for index, file := range group.files {
 			if changed[group.paths[index]] {
 				selected[packagePath] = true
+			}
+			// Interface callers need not import a changed implementation, but a
+			// direct method call still contains a selector with the method name.
+			// Select those packages without expanding their reverse importers.
+			if fileCallsMethodNamed(file, methodNames) {
+				methodCandidates[packagePath] = true
 			}
 			for _, spec := range file.Imports {
 				importPath, err := strconv.Unquote(spec.Path.Value)
@@ -602,6 +703,9 @@ func relevantPackagePaths(packagePaths []string, packages map[string]*parsedPack
 			}
 		}
 	}
+	for packagePath := range methodCandidates {
+		selected[packagePath] = true
+	}
 	result := make([]string, 0, len(selected))
 	for _, packagePath := range packagePaths {
 		if selected[packagePath] {
@@ -609,6 +713,44 @@ func relevantPackagePaths(packagePaths []string, packages map[string]*parsedPack
 		}
 	}
 	return result
+}
+
+func fileCallsMethodNamed(file *ast.File, methodNames map[string]bool) bool {
+	if len(methodNames) == 0 {
+		return false
+	}
+	found := false
+	ast.Inspect(file, func(node ast.Node) bool {
+		if found {
+			return false
+		}
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		selection := calledSelector(call.Fun)
+		if selection != nil && methodNames[selection.Sel.Name] {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func calledSelector(expression ast.Expr) *ast.SelectorExpr {
+	switch expression := expression.(type) {
+	case *ast.SelectorExpr:
+		return expression
+	case *ast.IndexExpr:
+		return calledSelector(expression.X)
+	case *ast.IndexListExpr:
+		return calledSelector(expression.X)
+	case *ast.ParenExpr:
+		return calledSelector(expression.X)
+	default:
+		return nil
+	}
 }
 
 func calledFunctions(info *types.Info, expression ast.Expr, receiverTypes []types.Type, implementingTypesByInterface map[*types.Interface][]types.Type) []*types.Func {
