@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,11 +27,10 @@ func TestOpenAcceptsRelativeRoot(t *testing.T) {
 func TestSQLiteFileURLHandlesWindowsPaths(t *testing.T) {
 	tests := []struct {
 		filename string
-		host     string
 		path     string
 	}{
 		{filename: `C:\state dir\simpleton.db`, path: "/C:/state dir/simpleton.db"},
-		{filename: `\\server\share\simpleton.db`, host: "server", path: "/share/simpleton.db"},
+		{filename: `\\server\share\simpleton.db`, path: "//server/share/simpleton.db"},
 	}
 	for _, test := range tests {
 		databaseURL := sqliteFileURL(test.filename)
@@ -38,8 +38,11 @@ func TestSQLiteFileURLHandlesWindowsPaths(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse SQLite URL for %q: %v", test.filename, err)
 		}
-		if parsed.Scheme != "file" || parsed.Host != test.host || parsed.Path != test.path {
+		if parsed.Scheme != "file" || parsed.Host != "" || parsed.Path != test.path {
 			t.Fatalf("invalid SQLite URL for %q: %s", test.filename, databaseURL.String())
+		}
+		if strings.HasPrefix(databaseURL.String(), "file://server/") {
+			t.Fatalf("SQLite URL retained a rejected UNC authority: %s", databaseURL.String())
 		}
 	}
 }
