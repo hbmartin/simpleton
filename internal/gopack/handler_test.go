@@ -399,6 +399,35 @@ func TestAnalyzeMethodChangePrunesPackagesWithoutCandidateCalls(t *testing.T) {
 	assertUnchangedCaller(t, result, "Value.Adjust", "caller/caller.go", "Public")
 }
 
+func TestAnalyzeDoesNotExpandReverseImportersOfMethodCandidates(t *testing.T) {
+	repo := t.TempDir()
+	git(t, repo, "init", "-q")
+	git(t, repo, "config", "user.email", "simpleton@example.invalid")
+	git(t, repo, "config", "user.name", "Simpleton Test")
+	write(t, filepath.Join(repo, "go.mod"), "module example.invalid/methodcandidate\n\ngo 1.24\n")
+	write(t, filepath.Join(repo, "dep", "value.go"), "package dep\n\ntype Value struct{}\nfunc (Value) Adjust(value int) int { return value }\n")
+	write(t, filepath.Join(repo, "candidate", "caller.go"), "package candidate\n\ntype Adjuster interface { Adjust(int) int }\nfunc Invoke(value Adjuster, input int) int { return value.Adjust(input) }\n")
+	write(t, filepath.Join(repo, "upper", "broken.go"), "package upper\n\nimport \"example.invalid/methodcandidate/candidate\"\nvar _ = candidate.Invoke\nvar Broken int = \"not an int\"\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-qm", "base")
+	base := git(t, repo, "rev-parse", "HEAD")
+	write(t, filepath.Join(repo, "dep", "value.go"), "package dep\n\ntype Value struct{}\nfunc (Value) Adjust(value int) int { return value + 1 }\n")
+	git(t, repo, "commit", "-qam", "candidate")
+	head := git(t, repo, "rev-parse", "HEAD")
+
+	result, err := (Handler{}).Analyze(context.Background(), packrpc.AnalyzeParams{
+		Repository: repo, BaseRevision: base, HeadRevision: head,
+		ChangedFiles: []gitx.ChangedFile{{Path: "dep/value.go", Language: "go"}}, BudgetMS: 10_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Methods[1].Status != domain.StatusRan {
+		t.Fatalf("reverse importer of method candidate contaminated type analysis: %#v", result.Methods[1])
+	}
+	assertUnchangedCaller(t, result, "Value.Adjust", "candidate/caller.go", "Invoke")
+}
+
 func TestAnalyzeFreeFunctionChangeInMethodFileRetainsPruning(t *testing.T) {
 	repo := t.TempDir()
 	git(t, repo, "init", "-q")
@@ -451,6 +480,29 @@ func TestParseRepositoryDiagnosesMissingRelevantSource(t *testing.T) {
 	}
 }
 
+func TestParseRepositoryPrunesMissingUnrelatedSource(t *testing.T) {
+	repo := t.TempDir()
+	git(t, repo, "init", "-q")
+	git(t, repo, "config", "user.email", "simpleton@example.invalid")
+	git(t, repo, "config", "user.name", "Simpleton Test")
+	write(t, filepath.Join(repo, "go.mod"), "module example.invalid/missing-unrelated\n\ngo 1.24\n")
+	write(t, filepath.Join(repo, "value.go"), "package missing\n\nfunc Value() int { return 1 }\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-qm", "sample")
+	revision := git(t, repo, "rev-parse", "HEAD")
+	repository, err := gitx.Open(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, diagnostics, _, err := parseRepository(context.Background(), repository, revision, []string{"go.mod", "value.go", "unrelated/missing.go"}, map[string]bool{"value.go": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsDiagnostic(diagnostics, "unrelated/missing.go") {
+		t.Fatalf("missing unrelated source contaminated diagnostics: %v", diagnostics)
+	}
+}
+
 func TestParseRepositoryDoesNotStoreSyntheticFilesAfterParseErrors(t *testing.T) {
 	repo := t.TempDir()
 	git(t, repo, "init", "-q")
@@ -499,6 +551,35 @@ func TestAnalyzeReportsSyntaxBrokenChangedFileAsInconclusive(t *testing.T) {
 	if len(result.Targets) != 0 || result.Methods[0].Status != domain.StatusInconclusive || result.Methods[0].Coverage != nil ||
 		result.Methods[1].Status != domain.StatusInconclusive || !strings.Contains(result.Methods[1].Reason, "parse value.go") {
 		t.Fatalf("syntax-broken changed file did not produce a scoped inconclusive result: %#v", result)
+	}
+}
+
+func TestAnalyzeReportsChangedSourceWithoutBuildProfileAsInconclusive(t *testing.T) {
+	repo := t.TempDir()
+	git(t, repo, "init", "-q")
+	git(t, repo, "config", "user.email", "simpleton@example.invalid")
+	git(t, repo, "config", "user.name", "Simpleton Test")
+	write(t, filepath.Join(repo, "go.mod"), "module example.invalid/unmatched\n\ngo 1.24\n")
+	write(t, filepath.Join(repo, "good.go"), "package unmatched\n\nfunc Good() int { return 1 }\n")
+	write(t, filepath.Join(repo, "impossible.go"), "//go:build custom && !custom\n\npackage unmatched\n\nfunc Impossible() int { return 1 }\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-qm", "base")
+	base := git(t, repo, "rev-parse", "HEAD")
+	write(t, filepath.Join(repo, "good.go"), "package unmatched\n\nfunc Good() int { return 2 }\n")
+	write(t, filepath.Join(repo, "impossible.go"), "//go:build custom && !custom\n\npackage unmatched\n\nfunc Impossible() int { return 2 }\n")
+	git(t, repo, "commit", "-qam", "candidate")
+	head := git(t, repo, "rev-parse", "HEAD")
+
+	result, err := (Handler{}).Analyze(context.Background(), packrpc.AnalyzeParams{
+		Repository: repo, BaseRevision: base, HeadRevision: head,
+		ChangedFiles: []gitx.ChangedFile{{Path: "good.go", Language: "go"}, {Path: "impossible.go", Language: "go"}}, BudgetMS: 10_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Methods[0].Status != domain.StatusInconclusive || result.Methods[0].Coverage != nil ||
+		result.Methods[1].Status != domain.StatusInconclusive || len(result.Targets) != 1 || result.Targets[0].Symbol != "Good" {
+		t.Fatalf("unmatched changed source was silently omitted: %#v", result)
 	}
 }
 
@@ -683,14 +764,126 @@ func TestAnalyzeMergesCallersAcrossCompatiblePlatformProfiles(t *testing.T) {
 }
 
 func TestBuildProfileSearchBacktracksAcrossCustomTags(t *testing.T) {
+	contents := []byte("//go:build (first || second) && !first\n\npackage sample\n")
 	expression, err := constraint.Parse("//go:build (first || second) && !first")
 	if err != nil {
 		t.Fatal(err)
 	}
-	source := goSource{path: "value.go", constraint: expression}
-	profile, ok := profileForSources([]goSource{source})
-	if !ok || !source.matches(profile) || profile.tags["first"] || !profile.tags["second"] {
-		t.Fatalf("build profile search did not backtrack to a satisfying tag assignment: profile=%#v ok=%t", profile, ok)
+	platforms, err := loadBuildPlatforms(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := goSource{path: "value.go", constraint: expression, contents: contents, analyzable: true}
+	profile, status := profileForSources([]goSource{source}, platforms)
+	if status != constraintSatisfied || !source.matches(profile) || profile.tags["first"] || !profile.tags["second"] {
+		t.Fatalf("build profile search did not backtrack to a satisfying tag assignment: profile=%#v status=%d", profile, status)
+	}
+}
+
+func TestBuildProfileUsesSupportedPlatformPairs(t *testing.T) {
+	contents := []byte("//go:build solaris\n\npackage sample\n")
+	expression, err := constraint.Parse("//go:build solaris")
+	if err != nil {
+		t.Fatal(err)
+	}
+	platforms, err := loadBuildPlatforms(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := goSource{path: "value.go", constraint: expression, contents: contents, analyzable: true}
+	profile, status := profileForSources([]goSource{source}, platforms)
+	if status != constraintSatisfied {
+		t.Fatalf("solaris profile was not found: status=%d", status)
+	}
+	valid := false
+	for _, platform := range platforms {
+		if platform.GOOS == profile.goos && platform.GOARCH == profile.goarch {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		t.Fatalf("profile used unsupported platform pair %s/%s", profile.goos, profile.goarch)
+	}
+}
+
+func TestBoringCryptoAliasIsFixedByToolchain(t *testing.T) {
+	platforms, err := loadBuildPlatforms(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := baseBuildProfile(platforms[0], false, map[string]bool{})
+	value, fixed := profile.fixedTag("boringcrypto")
+	if !fixed || value != profile.matchesTag("boringcrypto") {
+		t.Fatalf("boringcrypto alias was not fixed to the toolchain value: value=%t fixed=%t", value, fixed)
+	}
+}
+
+func TestConstraintBudgetExhaustionIsDistinctFromUnsatisfied(t *testing.T) {
+	expression, err := constraint.Parse("//go:build custom")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := buildProfile{tags: map[string]bool{}, platformTags: map[string]bool{}}
+	continuation := func(assignments map[string]bool) (map[string]bool, constraintSatisfaction) {
+		return assignments, constraintSatisfied
+	}
+	budget := 0
+	if _, status := satisfyConstraint(expression, true, profile, map[string]bool{}, &budget, continuation); status != constraintBudgetExhausted {
+		t.Fatalf("zero search budget returned status %d", status)
+	}
+	budget = 10
+	ignore, err := constraint.Parse("//go:build ignore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, status := satisfyConstraint(ignore, true, profile, map[string]bool{}, &budget, continuation); status != constraintUnsatisfied {
+		t.Fatalf("unsatisfied fixed tag returned status %d", status)
+	}
+}
+
+func TestSourceBuildConstraintUsesLegacyHeaderBoundary(t *testing.T) {
+	tests := []struct {
+		name   string
+		source string
+		want   bool
+	}{
+		{name: "legacy header", source: "// +build custom\n\npackage sample\n", want: true},
+		{name: "legacy package doc", source: "// Package sample documents custom builds.\n// +build custom\npackage sample\n", want: false},
+		{name: "modern package doc", source: "//go:build custom\npackage sample\n", want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			expression, err := sourceBuildConstraint(token.NewFileSet(), "sample.go", []byte(test.source))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (expression != nil) != test.want {
+				t.Fatalf("constraint presence=%t, want %t", expression != nil, test.want)
+			}
+		})
+	}
+}
+
+func TestPackageIndexPrefersCompletePackageOverPartialHint(t *testing.T) {
+	fset := token.NewFileSet()
+	realFile, err := parser.ParseFile(fset, "dep/value.go", "package dep\nfunc Value() int { return 1 }\n", parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	partialFile, parseErr := parser.ParseFile(fset, "dep/broken.go", "package other\nfunc Broken(\n", parser.SkipObjectResolution)
+	if parseErr == nil || partialFile == nil {
+		t.Fatalf("expected a partial AST, file=%#v err=%v", partialFile, parseErr)
+	}
+	metadata := packageMetadata{modules: []moduleMetadata{{root: ".", path: "example.invalid/index"}}}
+	index := indexSourcePackages(
+		map[string]*ast.File{"dep/value.go": realFile, "dep/broken.go": partialFile},
+		metadata,
+		map[string]bool{"dep/value.go": true},
+	)
+	group := index.packages["example.invalid/index/dep"]
+	if group == nil || len(group.paths) != 1 || group.paths[0] != "dep/value.go" {
+		t.Fatalf("partial package hint claimed canonical import path: %#v", index)
 	}
 }
 

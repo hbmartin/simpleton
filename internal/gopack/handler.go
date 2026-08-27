@@ -1,7 +1,9 @@
 package gopack
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -12,10 +14,14 @@ import (
 	"go/scanner"
 	"go/token"
 	"go/types"
+	"io"
+	"maps"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -158,7 +164,6 @@ type caller struct {
 type sourceDiagnostic struct {
 	path    string
 	message string
-	force   bool
 }
 
 type parseSummary struct {
@@ -170,12 +175,12 @@ type goSource struct {
 	path       string
 	file       *ast.File
 	constraint constraint.Expr
+	contents   []byte
+	analyzable bool
 }
 
 func parseRepository(ctx context.Context, repo gitx.Repository, revision string, paths []string, changed map[string]bool) (map[string]*ast.File, map[*ast.FuncDecl]string, map[string][]caller, []string, parseSummary, error) {
 	fset := token.NewFileSet()
-	parsed := map[string]*ast.File{}
-	hints := map[string]*ast.File{}
 	goSources := map[string]goSource{}
 	summary := parseSummary{}
 	goPaths := make([]string, 0)
@@ -204,7 +209,7 @@ func parseRepository(ctx context.Context, repo gitx.Repository, revision string,
 				if batchErr != nil {
 					fallbackFailures = append(fallbackFailures, failure)
 				} else {
-					sourceDiagnostics = append(sourceDiagnostics, sourceDiagnostic{path: path, message: failure.Error(), force: true})
+					sourceDiagnostics = append(sourceDiagnostics, sourceDiagnostic{path: path, message: failure.Error()})
 				}
 				if changed[path] {
 					summary.failedChanged++
@@ -212,10 +217,10 @@ func parseRepository(ctx context.Context, repo gitx.Repository, revision string,
 				continue
 			}
 		}
-		expression, err := sourceBuildConstraint(source)
+		expression, err := sourceBuildConstraint(fset, path, source)
 		if err != nil {
 			if hint, _ := parser.ParseFile(fset, path, source, parser.SkipObjectResolution); hint != nil {
-				hints[path] = hint
+				goSources[path] = goSource{path: path, file: hint, contents: source}
 			}
 			sourceDiagnostics = append(sourceDiagnostics, sourceDiagnostic{path: path, message: "build constraints " + path + ": " + err.Error()})
 			if changed[path] {
@@ -228,7 +233,7 @@ func parseRepository(ctx context.Context, repo gitx.Repository, revision string,
 		}
 		file, err := parser.ParseFile(fset, path, source, parser.SkipObjectResolution)
 		if file != nil {
-			hints[path] = file
+			goSources[path] = goSource{path: path, file: file, constraint: expression, contents: source}
 		}
 		if err != nil {
 			sourceDiagnostics = append(sourceDiagnostics, sourceDiagnostic{path: path, message: "parse " + path + ": " + err.Error()})
@@ -237,8 +242,7 @@ func parseRepository(ctx context.Context, repo gitx.Repository, revision string,
 			}
 			continue
 		}
-		parsed[path] = file
-		goSources[path] = goSource{path: path, file: file, constraint: expression}
+		goSources[path] = goSource{path: path, file: file, constraint: expression, contents: source, analyzable: true}
 	}
 	if len(fallbackFailures) > 0 {
 		return nil, nil, nil, nil, parseSummary{}, fmt.Errorf("batch-read Go sources: %w; fallback failures: %v", batchErr, errors.Join(fallbackFailures...))
@@ -247,18 +251,22 @@ func parseRepository(ctx context.Context, repo gitx.Repository, revision string,
 	if err := ctx.Err(); err != nil {
 		return nil, nil, nil, nil, parseSummary{}, err
 	}
-	methodNames := changedFileMethodNames(parsed, changed)
-	relevantDirectories := relevantSourceDirectories(hints, metadata, changed, methodNames)
-	profiles := compatibleBuildProfiles(goSources, relevantDirectories, changed)
+	platforms, err := loadBuildPlatforms(ctx)
+	if err != nil {
+		return nil, nil, nil, nil, parseSummary{}, err
+	}
+	methodNames := changedFileMethodNames(goSources, changed)
+	relevantDirectories := relevantSourceDirectories(goSources, metadata, changed, methodNames)
+	profiles, profileDiagnostics := compatibleBuildProfiles(goSources, relevantDirectories, changed, platforms)
 	activeParsed := map[string]*ast.File{}
 	declarationKeys := map[*ast.FuncDecl]string{}
 	callers := map[string][]caller{}
-	var diagnostics []string
+	diagnostics := slices.Clone(profileDiagnostics)
 	checkedDirectories := map[string]bool{}
 	for _, profile := range profiles {
 		profileParsed := map[string]*ast.File{}
 		for path, source := range goSources {
-			if source.matches(profile) {
+			if source.analyzable && source.matches(profile) {
 				profileParsed[path] = source.file
 				activeParsed[path] = source.file
 			}
@@ -283,28 +291,23 @@ func parseRepository(ctx context.Context, repo gitx.Repository, revision string,
 	}
 	for _, diagnostic := range sourceDiagnostics {
 		directory := filepath.Dir(diagnostic.path)
-		if diagnostic.force || changed[diagnostic.path] || relevantDirectories[directory] || checkedDirectories[directory] {
+		if changed[diagnostic.path] || relevantDirectories[directory] || checkedDirectories[directory] {
 			diagnostics = append(diagnostics, diagnostic.message)
 		}
 	}
-	for path := range activeParsed {
-		if changed[path] {
+	for path, source := range goSources {
+		if !changed[path] || !source.analyzable {
+			continue
+		}
+		if activeParsed[path] != nil {
 			summary.eligibleChanged++
+		} else {
+			summary.failedChanged++
 		}
 	}
 	slices.Sort(diagnostics)
 	diagnostics = slices.Compact(diagnostics)
-	for key, entries := range callers {
-		slices.SortFunc(entries, func(left, right caller) int {
-			if left.Path != right.Path {
-				return strings.Compare(left.Path, right.Path)
-			}
-			return strings.Compare(left.Symbol, right.Symbol)
-		})
-		callers[key] = slices.CompactFunc(entries, func(left, right caller) bool {
-			return left.Path == right.Path && left.Symbol == right.Symbol
-		})
-	}
+	normalizeCallers(callers)
 	return activeParsed, declarationKeys, callers, diagnostics, summary, nil
 }
 
@@ -324,10 +327,10 @@ func goSourceCandidate(path string) bool {
 	return true
 }
 
-func sourceBuildConstraint(source []byte) (constraint.Expr, error) {
+func sourceBuildConstraint(fset *token.FileSet, path string, source []byte) (constraint.Expr, error) {
 	var goBuild constraint.Expr
 	var plusBuild constraint.Expr
-	file := token.NewFileSet().AddFile("", -1, len(source))
+	file := fset.AddFile(path+":build-constraints", -1, len(source))
 	var lexer scanner.Scanner
 	lexer.Init(file, source, nil, scanner.ScanComments)
 	for {
@@ -349,23 +352,49 @@ func sourceBuildConstraint(source []byte) (constraint.Expr, error) {
 			goBuild = expression
 			continue
 		}
-		if constraint.IsPlusBuild(literal) {
-			expression, err := constraint.Parse(literal)
-			if err != nil {
-				// The Go build system ignores malformed legacy +build lines.
-				continue
-			}
-			if plusBuild == nil {
-				plusBuild = expression
-			} else {
-				plusBuild = &constraint.AndExpr{X: plusBuild, Y: expression}
-			}
-		}
 	}
 	if goBuild != nil {
 		return goBuild, nil
 	}
+	for _, rawLine := range bytes.Split(legacyBuildHeader(source), []byte{'\n'}) {
+		literal := string(bytes.TrimSpace(rawLine))
+		if !constraint.IsPlusBuild(literal) {
+			continue
+		}
+		expression, err := constraint.Parse(literal)
+		if err != nil {
+			// The Go build system ignores malformed legacy +build lines.
+			continue
+		}
+		if plusBuild == nil {
+			plusBuild = expression
+		} else {
+			plusBuild = &constraint.AndExpr{X: plusBuild, Y: expression}
+		}
+	}
 	return plusBuild, nil
+}
+
+func legacyBuildHeader(source []byte) []byte {
+	end := 0
+	offset := 0
+	for len(source) > offset {
+		next := bytes.IndexByte(source[offset:], '\n')
+		lineEnd := len(source)
+		if next >= 0 {
+			lineEnd = offset + next + 1
+		}
+		line := bytes.TrimSpace(source[offset:lineEnd])
+		switch {
+		case len(line) == 0:
+			end = lineEnd
+		case bytes.HasPrefix(line, []byte("//")):
+		default:
+			return source[:end]
+		}
+		offset = lineEnd
+	}
+	return source[:end]
 }
 
 func requiresIgnoreTag(expression constraint.Expr) bool {
@@ -381,62 +410,103 @@ func requiresIgnoreTag(expression constraint.Expr) bool {
 	}
 }
 
-var knownGOOS = []string{
-	"aix", "android", "darwin", "dragonfly", "freebsd", "hurd", "illumos", "ios", "js",
-	"linux", "nacl", "netbsd", "openbsd", "plan9", "solaris", "wasip1", "windows", "zos",
+type buildPlatform struct {
+	GOOS         string `json:"GOOS"`
+	GOARCH       string `json:"GOARCH"`
+	CgoSupported bool   `json:"CgoSupported"`
 }
 
-var knownGOARCH = []string{
-	"386", "amd64", "amd64p32", "arm", "armbe", "arm64", "arm64be", "loong64", "mips", "mipsle",
-	"mips64", "mips64le", "mips64p32", "mips64p32le", "ppc", "ppc64", "ppc64le", "riscv", "riscv64",
-	"s390", "s390x", "sparc", "sparc64", "wasm",
+var buildPlatformCache struct {
+	sync.Mutex
+	platforms []buildPlatform
 }
 
-var knownGOOSSet = stringSet(knownGOOS)
-var knownGOARCHSet = stringSet(knownGOARCH)
-var unixGOOS = stringSet([]string{"aix", "android", "darwin", "dragonfly", "freebsd", "hurd", "illumos", "ios", "linux", "netbsd", "openbsd", "solaris"})
+func loadBuildPlatforms(ctx context.Context) ([]buildPlatform, error) {
+	buildPlatformCache.Lock()
+	if len(buildPlatformCache.platforms) > 0 {
+		platforms := slices.Clone(buildPlatformCache.platforms)
+		buildPlatformCache.Unlock()
+		return platforms, nil
+	}
+	buildPlatformCache.Unlock()
+
+	output, err := exec.CommandContext(ctx, "go", "tool", "dist", "list", "-json").Output()
+	if err != nil {
+		return nil, fmt.Errorf("list supported Go platforms: %w", err)
+	}
+	var platforms []buildPlatform
+	if err := json.Unmarshal(output, &platforms); err != nil {
+		return nil, fmt.Errorf("decode supported Go platforms: %w", err)
+	}
+	if len(platforms) == 0 {
+		return nil, errors.New("Go toolchain returned no supported platforms")
+	}
+	slices.SortStableFunc(platforms, func(left, right buildPlatform) int {
+		leftRank := platformPreference(left)
+		rightRank := platformPreference(right)
+		if leftRank != rightRank {
+			return leftRank - rightRank
+		}
+		if left.GOOS != right.GOOS {
+			return strings.Compare(left.GOOS, right.GOOS)
+		}
+		return strings.Compare(left.GOARCH, right.GOARCH)
+	})
+	buildPlatformCache.Lock()
+	if len(buildPlatformCache.platforms) == 0 {
+		buildPlatformCache.platforms = slices.Clone(platforms)
+	}
+	platforms = slices.Clone(buildPlatformCache.platforms)
+	buildPlatformCache.Unlock()
+	return platforms, nil
+}
+
+func platformPreference(platform buildPlatform) int {
+	switch {
+	case platform.GOOS == build.Default.GOOS && platform.GOARCH == build.Default.GOARCH:
+		return 0
+	case platform.GOOS == build.Default.GOOS:
+		return 1
+	case platform.GOARCH == build.Default.GOARCH:
+		return 2
+	default:
+		return 3
+	}
+}
 
 type buildProfile struct {
-	goos     string
-	goarch   string
-	compiler string
-	cgo      bool
-	tags     map[string]bool
+	goos         string
+	goarch       string
+	compiler     string
+	cgo          bool
+	tags         map[string]bool
+	platformTags map[string]bool
 }
 
 func (source goSource) matches(profile buildProfile) bool {
-	if !matchesBuildFilename(filepath.Base(source.path), profile) {
-		return false
+	buildContext := build.Default
+	buildContext.GOOS = profile.goos
+	buildContext.GOARCH = profile.goarch
+	buildContext.Compiler = profile.compiler
+	buildContext.CgoEnabled = profile.cgo
+	buildContext.BuildTags = enabledTags(profile.tags)
+	buildContext.OpenFile = func(string) (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(source.contents)), nil
 	}
-	return source.constraint == nil || source.constraint.Eval(profile.matchesTag)
+	matched, err := buildContext.MatchFile(".", filepath.Base(source.path))
+	return err == nil && matched
 }
 
 func (profile buildProfile) matchesTag(tag string) bool {
-	switch {
-	case tag == "cgo":
-		return profile.cgo
-	case tag == profile.goos || tag == profile.goarch || tag == profile.compiler:
-		return true
-	case profile.goos == "android" && tag == "linux":
-		return true
-	case profile.goos == "illumos" && tag == "solaris":
-		return true
-	case profile.goos == "ios" && tag == "darwin":
-		return true
-	case tag == "unix":
-		return unixGOOS[profile.goos]
-	case tag == "boringcrypto":
-		return profile.tags["goexperiment.boringcrypto"]
-	default:
-		return profile.tags[tag]
-	}
+	source := goSource{path: "tag.go", contents: []byte("//go:build " + tag + "\n\npackage tag\n")}
+	return source.matches(profile)
 }
 
 func (profile buildProfile) fixedTag(tag string) (bool, bool) {
 	if tag == "ignore" {
 		return false, true
 	}
-	if tag == "cgo" || tag == "unix" || tag == "gc" || tag == "gccgo" || knownGOOSSet[tag] || knownGOARCHSet[tag] {
+	if tag == "cgo" || tag == "unix" || tag == "gc" || tag == "gccgo" || tag == "boringcrypto" || profile.platformTags[tag] {
 		return profile.matchesTag(tag), true
 	}
 	if strings.HasPrefix(tag, "go1.") || strings.HasPrefix(tag, "goexperiment.") || profile.tags[tag] {
@@ -447,10 +517,7 @@ func (profile buildProfile) fixedTag(tag string) (bool, bool) {
 
 func (profile buildProfile) withAssignments(assignments map[string]bool) buildProfile {
 	result := profile
-	result.tags = make(map[string]bool, len(profile.tags)+len(assignments))
-	for tag, enabled := range profile.tags {
-		result.tags[tag] = enabled
-	}
+	result.tags = maps.Clone(profile.tags)
 	for tag, enabled := range assignments {
 		if enabled {
 			result.tags[tag] = true
@@ -470,7 +537,7 @@ func (profile buildProfile) key() string {
 	return fmt.Sprintf("%s/%s/%s/%t/%s", profile.goos, profile.goarch, profile.compiler, profile.cgo, strings.Join(tags, ","))
 }
 
-func compatibleBuildProfiles(sources map[string]goSource, relevantDirectories map[string]bool, changed map[string]bool) []buildProfile {
+func compatibleBuildProfiles(sources map[string]goSource, relevantDirectories map[string]bool, changed map[string]bool, platforms []buildPlatform) ([]buildProfile, []string) {
 	paths := make([]string, 0, len(sources))
 	for path := range sources {
 		paths = append(paths, path)
@@ -478,14 +545,15 @@ func compatibleBuildProfiles(sources map[string]goSource, relevantDirectories ma
 	slices.Sort(paths)
 	changedSources := make([]goSource, 0)
 	for _, path := range paths {
-		if changed[path] {
+		if changed[path] && sources[path].analyzable {
 			changedSources = append(changedSources, sources[path])
 		}
 	}
 	if len(changedSources) == 0 {
-		return nil
+		return nil, nil
 	}
 	profiles := make([]buildProfile, 0)
+	var diagnostics []string
 	seen := map[string]bool{}
 	appendProfile := func(profile buildProfile) {
 		key := profile.key()
@@ -498,24 +566,40 @@ func compatibleBuildProfiles(sources map[string]goSource, relevantDirectories ma
 		if profilesMatchSource(profiles, source) {
 			continue
 		}
-		if profile, ok := profileForSources([]goSource{source}); ok {
+		profile, status := profileForSources([]goSource{source}, platforms)
+		if status == constraintSatisfied {
 			appendProfile(profile)
+		}
+		if status == constraintBudgetExhausted {
+			diagnostics = append(diagnostics, "build profile search budget exhausted for "+source.path)
+		} else if status == constraintUnsatisfied {
+			diagnostics = append(diagnostics, "no compatible build profile for "+source.path)
 		}
 	}
 	for _, path := range paths {
 		source := sources[path]
-		if !relevantDirectories[filepath.Dir(path)] || profilesMatchSource(profiles, source) {
+		if !source.analyzable || !relevantDirectories[filepath.Dir(path)] || profilesMatchSource(profiles, source) {
 			continue
 		}
+		exhausted := false
+		matched := false
 		for _, changedSource := range changedSources {
-			profile, ok := profileForSources([]goSource{changedSource, source})
-			if ok {
+			profile, status := profileForSources([]goSource{changedSource, source}, platforms)
+			if status == constraintSatisfied {
 				appendProfile(profile)
+				matched = true
 				break
 			}
+			if status == constraintBudgetExhausted {
+				exhausted = true
+			}
+		}
+		if !matched && exhausted {
+			diagnostics = append(diagnostics, "build profile search budget exhausted while pairing changed sources with "+source.path)
 		}
 	}
-	return profiles
+	slices.Sort(diagnostics)
+	return profiles, slices.Compact(diagnostics)
 }
 
 func profilesMatchSource(profiles []buildProfile, source goSource) bool {
@@ -527,175 +611,155 @@ func profilesMatchSource(profiles []buildProfile, source goSource) bool {
 	return false
 }
 
-func profileForSources(sources []goSource) (buildProfile, bool) {
-	gooses := preferredValues(build.Default.GOOS, knownGOOS)
-	goarches := preferredValues(build.Default.GOARCH, knownGOARCH)
-	cgoValues := []bool{build.Default.CgoEnabled, !build.Default.CgoEnabled}
-	for _, goos := range gooses {
-		for _, goarch := range goarches {
-			for _, cgoEnabled := range cgoValues {
-				profile := baseBuildProfile(goos, goarch, cgoEnabled)
-				compatible := true
-				for _, source := range sources {
-					if !matchesBuildFilename(filepath.Base(source.path), profile) {
-						compatible = false
-						break
-					}
+func profileForSources(sources []goSource, platforms []buildPlatform) (buildProfile, constraintSatisfaction) {
+	platformTags := map[string]bool{}
+	for _, platform := range platforms {
+		platformTags[platform.GOOS] = true
+		platformTags[platform.GOARCH] = true
+	}
+	exhausted := false
+	for _, platform := range platforms {
+		cgoValues := []bool{false}
+		if platform.CgoSupported {
+			cgoValues = []bool{build.Default.CgoEnabled, !build.Default.CgoEnabled}
+		}
+		for _, cgoEnabled := range cgoValues {
+			profile := baseBuildProfile(platform, cgoEnabled, platformTags)
+			searchBudget := buildConstraintSearchBudget
+			assignments, status := satisfySourceConstraints(sources, 0, profile, map[string]bool{}, &searchBudget)
+			if status == constraintBudgetExhausted {
+				exhausted = true
+				continue
+			}
+			if status != constraintSatisfied {
+				continue
+			}
+			profile = profile.withAssignments(assignments)
+			compatible := true
+			for _, source := range sources {
+				if !source.matches(profile) {
+					compatible = false
+					break
 				}
-				if !compatible {
-					continue
-				}
-				searchBudget := 4096
-				assignments, ok := satisfySourceConstraints(sources, 0, profile, map[string]bool{}, &searchBudget)
-				if !ok {
-					continue
-				}
-				profile = profile.withAssignments(assignments)
-				for _, source := range sources {
-					if !source.matches(profile) {
-						compatible = false
-						break
-					}
-				}
-				if compatible {
-					return profile, true
-				}
+			}
+			if compatible {
+				return profile, constraintSatisfied
 			}
 		}
 	}
-	return buildProfile{}, false
+	if exhausted {
+		return buildProfile{}, constraintBudgetExhausted
+	}
+	return buildProfile{}, constraintUnsatisfied
 }
 
-func baseBuildProfile(goos, goarch string, cgoEnabled bool) buildProfile {
+func baseBuildProfile(platform buildPlatform, cgoEnabled bool, platformTags map[string]bool) buildProfile {
 	tags := make(map[string]bool, len(build.Default.BuildTags)+len(build.Default.ToolTags)+len(build.Default.ReleaseTags))
 	for _, values := range [][]string{build.Default.BuildTags, build.Default.ToolTags, build.Default.ReleaseTags} {
 		for _, tag := range values {
 			tags[tag] = true
 		}
 	}
-	return buildProfile{goos: goos, goarch: goarch, compiler: build.Default.Compiler, cgo: cgoEnabled, tags: tags}
+	return buildProfile{
+		goos: platform.GOOS, goarch: platform.GOARCH, compiler: build.Default.Compiler, cgo: cgoEnabled,
+		tags: tags, platformTags: platformTags,
+	}
 }
 
-type constraintContinuation func(map[string]bool) (map[string]bool, bool)
+type constraintSatisfaction uint8
 
-func satisfySourceConstraints(sources []goSource, index int, profile buildProfile, assignments map[string]bool, searchBudget *int) (map[string]bool, bool) {
+const buildConstraintSearchBudget = 4096
+
+const (
+	constraintUnsatisfied constraintSatisfaction = iota
+	constraintSatisfied
+	constraintBudgetExhausted
+)
+
+type constraintContinuation func(map[string]bool) (map[string]bool, constraintSatisfaction)
+
+func satisfySourceConstraints(sources []goSource, index int, profile buildProfile, assignments map[string]bool, searchBudget *int) (map[string]bool, constraintSatisfaction) {
 	if index == len(sources) {
-		return assignments, true
+		return assignments, constraintSatisfied
 	}
 	if sources[index].constraint == nil {
 		return satisfySourceConstraints(sources, index+1, profile, assignments, searchBudget)
 	}
-	return satisfyConstraint(sources[index].constraint, true, profile, assignments, searchBudget, func(next map[string]bool) (map[string]bool, bool) {
+	return satisfyConstraint(sources[index].constraint, true, profile, assignments, searchBudget, func(next map[string]bool) (map[string]bool, constraintSatisfaction) {
 		return satisfySourceConstraints(sources, index+1, profile, next, searchBudget)
 	})
 }
 
-func satisfyConstraint(expression constraint.Expr, wanted bool, profile buildProfile, assignments map[string]bool, searchBudget *int, continuation constraintContinuation) (map[string]bool, bool) {
+func satisfyConstraint(expression constraint.Expr, wanted bool, profile buildProfile, assignments map[string]bool, searchBudget *int, continuation constraintContinuation) (map[string]bool, constraintSatisfaction) {
 	if *searchBudget <= 0 {
-		return nil, false
+		return nil, constraintBudgetExhausted
 	}
 	*searchBudget = *searchBudget - 1
 	switch expression := expression.(type) {
 	case *constraint.TagExpr:
 		if value, fixed := profile.fixedTag(expression.Tag); fixed {
 			if value != wanted {
-				return nil, false
+				return nil, constraintUnsatisfied
 			}
 			return continuation(assignments)
 		}
 		if value, exists := assignments[expression.Tag]; exists {
 			if value != wanted {
-				return nil, false
+				return nil, constraintUnsatisfied
 			}
 			return continuation(assignments)
 		}
-		result := cloneBoolMap(assignments)
+		result := maps.Clone(assignments)
 		result[expression.Tag] = wanted
 		return continuation(result)
 	case *constraint.NotExpr:
 		return satisfyConstraint(expression.X, !wanted, profile, assignments, searchBudget, continuation)
 	case *constraint.AndExpr:
 		if wanted {
-			return satisfyConstraint(expression.X, true, profile, assignments, searchBudget, func(left map[string]bool) (map[string]bool, bool) {
+			return satisfyConstraint(expression.X, true, profile, assignments, searchBudget, func(left map[string]bool) (map[string]bool, constraintSatisfaction) {
 				return satisfyConstraint(expression.Y, true, profile, left, searchBudget, continuation)
 			})
 		}
-		if left, ok := satisfyConstraint(expression.X, false, profile, assignments, searchBudget, continuation); ok {
-			return left, true
+		left, status := satisfyConstraint(expression.X, false, profile, assignments, searchBudget, continuation)
+		if status != constraintUnsatisfied {
+			return left, status
 		}
 		return satisfyConstraint(expression.Y, false, profile, assignments, searchBudget, continuation)
 	case *constraint.OrExpr:
 		if wanted {
-			if left, ok := satisfyConstraint(expression.X, true, profile, assignments, searchBudget, continuation); ok {
-				return left, true
+			left, status := satisfyConstraint(expression.X, true, profile, assignments, searchBudget, continuation)
+			if status != constraintUnsatisfied {
+				return left, status
 			}
 			return satisfyConstraint(expression.Y, true, profile, assignments, searchBudget, continuation)
 		}
-		return satisfyConstraint(expression.X, false, profile, assignments, searchBudget, func(left map[string]bool) (map[string]bool, bool) {
+		return satisfyConstraint(expression.X, false, profile, assignments, searchBudget, func(left map[string]bool) (map[string]bool, constraintSatisfaction) {
 			return satisfyConstraint(expression.Y, false, profile, left, searchBudget, continuation)
 		})
 	default:
-		return nil, false
+		return nil, constraintUnsatisfied
 	}
 }
 
-func matchesBuildFilename(filename string, profile buildProfile) bool {
-	stem, _, _ := strings.Cut(filename, ".")
-	underscore := strings.Index(stem, "_")
-	if underscore < 0 {
-		return true
-	}
-	parts := strings.Split(stem[underscore+1:], "_")
-	if len(parts) > 0 && parts[len(parts)-1] == "test" {
-		parts = parts[:len(parts)-1]
-	}
-	if len(parts) >= 2 && knownGOOSSet[parts[len(parts)-2]] && knownGOARCHSet[parts[len(parts)-1]] {
-		return profile.matchesTag(parts[len(parts)-2]) && profile.matchesTag(parts[len(parts)-1])
-	}
-	if len(parts) >= 1 {
-		last := parts[len(parts)-1]
-		if knownGOOSSet[last] || knownGOARCHSet[last] {
-			return profile.matchesTag(last)
+func enabledTags(tags map[string]bool) []string {
+	result := make([]string, 0, len(tags))
+	for tag, enabled := range tags {
+		if enabled {
+			result = append(result, tag)
 		}
 	}
-	return true
-}
-
-func preferredValues(preferred string, values []string) []string {
-	result := make([]string, 0, len(values)+1)
-	result = append(result, preferred)
-	for _, value := range values {
-		if value != preferred {
-			result = append(result, value)
-		}
-	}
+	slices.Sort(result)
 	return result
 }
 
-func stringSet(values []string) map[string]bool {
-	result := make(map[string]bool, len(values))
-	for _, value := range values {
-		result[value] = true
-	}
-	return result
-}
-
-func cloneBoolMap(values map[string]bool) map[string]bool {
-	result := make(map[string]bool, len(values)+1)
-	for key, value := range values {
-		result[key] = value
-	}
-	return result
-}
-
-func changedFileMethodNames(parsed map[string]*ast.File, changed map[string]bool) map[string]bool {
+func changedFileMethodNames(sources map[string]goSource, changed map[string]bool) map[string]bool {
 	result := map[string]bool{}
 	for path := range changed {
-		file := parsed[path]
-		if file == nil {
+		source := sources[path]
+		if !source.analyzable || source.file == nil {
 			continue
 		}
-		for _, declaration := range file.Decls {
+		for _, declaration := range source.file.Decls {
 			if function, ok := declaration.(*ast.FuncDecl); ok && function.Recv != nil {
 				result[function.Name.Name] = true
 			}
@@ -705,11 +769,19 @@ func changedFileMethodNames(parsed map[string]*ast.File, changed map[string]bool
 }
 
 type sourcePackageGroup struct {
-	paths []string
-	files []*ast.File
+	key       string
+	paths     []string
+	files     []*ast.File
+	preferred bool
 }
 
-func relevantSourceDirectories(files map[string]*ast.File, metadata packageMetadata, changed map[string]bool, methodNames map[string]bool) map[string]bool {
+type sourcePackageIndex struct {
+	paths       []string
+	packages    map[string]*sourcePackageGroup
+	diagnostics []string
+}
+
+func indexSourcePackages(files map[string]*ast.File, metadata packageMetadata, preferredPaths map[string]bool) sourcePackageIndex {
 	paths := make([]string, 0, len(files))
 	for path := range files {
 		paths = append(paths, path)
@@ -718,41 +790,87 @@ func relevantSourceDirectories(files map[string]*ast.File, metadata packageMetad
 	groups := map[string]*sourcePackageGroup{}
 	for _, path := range paths {
 		file := files[path]
-		if file == nil || file.Name == nil {
+		if file == nil || file.Name == nil || file.Name.Name == "" {
 			continue
 		}
 		key := filepath.Dir(path) + ":" + file.Name.Name
 		group := groups[key]
 		if group == nil {
-			group = &sourcePackageGroup{}
+			group = &sourcePackageGroup{key: key}
 			groups[key] = group
 		}
 		group.paths = append(group.paths, path)
 		group.files = append(group.files, file)
+		group.preferred = group.preferred || preferredPaths[path]
 	}
-	packages := map[string]*sourcePackageGroup{}
-	packagePaths := make([]string, 0, len(groups))
-	for key, group := range groups {
+	groupKeys := make([]string, 0, len(groups))
+	for key := range groups {
+		groupKeys = append(groupKeys, key)
+	}
+	slices.Sort(groupKeys)
+	groupsByImportPath := map[string][]*sourcePackageGroup{}
+	for _, key := range groupKeys {
+		group := groups[key]
 		directory := filepath.ToSlash(filepath.Dir(group.paths[0]))
-		packagePath := metadata.packagePath(directory, key)
-		if packages[packagePath] != nil {
-			packagePath = key
-		}
-		packages[packagePath] = group
-		packagePaths = append(packagePaths, packagePath)
+		packagePath := metadata.packagePath(directory, group.key)
+		groupsByImportPath[packagePath] = append(groupsByImportPath[packagePath], group)
 	}
-	slices.Sort(packagePaths)
+	resolvedPaths := make([]string, 0, len(groupsByImportPath))
+	for packagePath := range groupsByImportPath {
+		resolvedPaths = append(resolvedPaths, packagePath)
+	}
+	slices.Sort(resolvedPaths)
+	index := sourcePackageIndex{packages: map[string]*sourcePackageGroup{}}
+	for _, resolvedPath := range resolvedPaths {
+		candidates := groupsByImportPath[resolvedPath]
+		slices.SortStableFunc(candidates, func(left, right *sourcePackageGroup) int {
+			if left.preferred != right.preferred {
+				if left.preferred {
+					return -1
+				}
+				return 1
+			}
+			return strings.Compare(left.key, right.key)
+		})
+		for indexInPath, group := range candidates {
+			packagePath := resolvedPath
+			if indexInPath > 0 {
+				packagePath = group.key
+				index.diagnostics = append(index.diagnostics, resolvedPath+": multiple packages resolve to the same import path")
+			}
+			index.packages[packagePath] = group
+			index.paths = append(index.paths, packagePath)
+		}
+	}
+	slices.Sort(index.paths)
+	slices.Sort(index.diagnostics)
+	index.diagnostics = slices.Compact(index.diagnostics)
+	return index
+}
+
+func relevantSourceDirectories(sources map[string]goSource, metadata packageMetadata, changed map[string]bool, methodNames map[string]bool) map[string]bool {
+	files := map[string]*ast.File{}
+	preferredPaths := map[string]bool{}
+	for path, source := range sources {
+		if source.file != nil {
+			files[path] = source.file
+		}
+		if source.analyzable {
+			preferredPaths[path] = true
+		}
+	}
+	index := indexSourcePackages(files, metadata, preferredPaths)
 	selected := map[string]bool{}
-	importers := make(map[string][]string, len(packages))
-	for _, packagePath := range packagePaths {
-		group := packages[packagePath]
-		for index, file := range group.files {
-			if changed[group.paths[index]] {
+	importers := make(map[string][]string, len(index.packages))
+	for _, packagePath := range index.paths {
+		group := index.packages[packagePath]
+		for fileIndex, file := range group.files {
+			if changed[group.paths[fileIndex]] {
 				selected[packagePath] = true
 			}
 			for _, spec := range file.Imports {
 				importPath, err := strconv.Unquote(spec.Path.Value)
-				if err == nil && packages[importPath] != nil {
+				if err == nil && index.packages[importPath] != nil {
 					importers[importPath] = append(importers[importPath], packagePath)
 				}
 			}
@@ -760,11 +878,11 @@ func relevantSourceDirectories(files map[string]*ast.File, metadata packageMetad
 	}
 	expandReverseImporters(selected, importers)
 	if len(methodNames) > 0 {
-		for _, packagePath := range packagePaths {
+		for _, packagePath := range index.paths {
 			if selected[packagePath] {
 				continue
 			}
-			for _, file := range packages[packagePath].files {
+			for _, file := range index.packages[packagePath].files {
 				if fileCallsMethodNamed(file, methodNames) {
 					selected[packagePath] = true
 					break
@@ -774,7 +892,7 @@ func relevantSourceDirectories(files map[string]*ast.File, metadata packageMetad
 	}
 	directories := map[string]bool{}
 	for packagePath := range selected {
-		for _, path := range packages[packagePath].paths {
+		for _, path := range index.packages[packagePath].paths {
 			directories[filepath.Dir(path)] = true
 		}
 	}
@@ -896,8 +1014,7 @@ func (m packageMetadata) packagePath(directory, fallback string) string {
 }
 
 type parsedPackage struct {
-	paths      []string
-	files      []*ast.File
+	sourcePackageGroup
 	info       *types.Info
 	types      *types.Package
 	checking   bool
@@ -1003,41 +1120,16 @@ func typeCheckWithImporter(ctx context.Context, fset *token.FileSet, parsed map[
 }
 
 func typeCheckSynchronously(ctx context.Context, fset *token.FileSet, parsed map[string]*ast.File, metadata packageMetadata, changed map[string]bool, relevantDirectories map[string]bool, fallback types.Importer) (map[*ast.FuncDecl]string, map[string][]caller, []string, map[string]bool, error) {
-	groups := map[string]*parsedPackage{}
-	paths := make([]string, 0, len(parsed))
-	for path := range parsed {
-		paths = append(paths, path)
-	}
-	slices.Sort(paths)
-	for _, path := range paths {
-		file := parsed[path]
-		directory := filepath.Dir(path)
-		key := directory + ":" + file.Name.Name
-		group := groups[key]
-		if group == nil {
-			group = &parsedPackage{}
-			groups[key] = group
-		}
-		group.paths = append(group.paths, path)
-		group.files = append(group.files, file)
-	}
 	diagnostics := slices.Clone(metadata.diagnostics)
 	declarationKeys := map[*ast.FuncDecl]string{}
 	callers := map[string][]caller{}
+	index := indexSourcePackages(parsed, metadata, nil)
+	diagnostics = append(diagnostics, index.diagnostics...)
 	packages := map[string]*parsedPackage{}
-	packagePaths := make([]string, 0, len(groups))
-	for key, group := range groups {
-		directory := filepath.ToSlash(filepath.Dir(group.paths[0]))
-		packagePath := metadata.packagePath(directory, key)
-		if packages[packagePath] != nil {
-			diagnostics = append(diagnostics, packagePath+": multiple packages resolve to the same import path")
-			packagePath = key
-		}
-		packages[packagePath] = group
-		packagePaths = append(packagePaths, packagePath)
+	for packagePath, group := range index.packages {
+		packages[packagePath] = &parsedPackage{sourcePackageGroup: *group}
 	}
-	slices.Sort(packagePaths)
-	relevantPaths := relevantPackagePaths(packagePaths, packages, changed, relevantDirectories)
+	relevantPaths := relevantPackagePaths(index.paths, packages, changed, relevantDirectories)
 	checker := &repositoryImporter{
 		ctx: ctx, fset: fset, packages: packages,
 		fallback: fallback, diagnostics: &diagnostics,
@@ -1051,8 +1143,8 @@ func typeCheckSynchronously(ctx context.Context, fset *token.FileSet, parsed map
 			return nil, nil, nil, nil, err
 		}
 	}
-	checkedPaths := make([]string, 0, len(packagePaths))
-	for _, packagePath := range packagePaths {
+	checkedPaths := make([]string, 0, len(index.paths))
+	for _, packagePath := range index.paths {
 		if packages[packagePath].checked {
 			checkedPaths = append(checkedPaths, packagePath)
 		}
@@ -1128,6 +1220,31 @@ func typeCheckSynchronously(ctx context.Context, fset *token.FileSet, parsed map
 	}
 	slices.Sort(diagnostics)
 	diagnostics = slices.Compact(diagnostics)
+	normalizeCallers(callers)
+	checkedDirectories := map[string]bool{}
+	for _, packagePath := range checkedPaths {
+		for _, path := range packages[packagePath].paths {
+			checkedDirectories[filepath.Dir(path)] = true
+		}
+	}
+	return declarationKeys, callers, diagnostics, checkedDirectories, nil
+}
+
+func relevantPackagePaths(packagePaths []string, packages map[string]*parsedPackage, changed map[string]bool, relevantDirectories map[string]bool) []string {
+	result := make([]string, 0)
+	for _, packagePath := range packagePaths {
+		group := packages[packagePath]
+		for _, path := range group.paths {
+			if changed[path] || relevantDirectories[filepath.Dir(path)] {
+				result = append(result, packagePath)
+				break
+			}
+		}
+	}
+	return result
+}
+
+func normalizeCallers(callers map[string][]caller) {
 	for key, entries := range callers {
 		slices.SortFunc(entries, func(left, right caller) int {
 			if left.Path != right.Path {
@@ -1139,43 +1256,6 @@ func typeCheckSynchronously(ctx context.Context, fset *token.FileSet, parsed map
 			return left.Path == right.Path && left.Symbol == right.Symbol
 		})
 	}
-	checkedDirectories := map[string]bool{}
-	for _, packagePath := range checkedPaths {
-		for _, path := range packages[packagePath].paths {
-			checkedDirectories[filepath.Dir(path)] = true
-		}
-	}
-	return declarationKeys, callers, diagnostics, checkedDirectories, nil
-}
-
-func relevantPackagePaths(packagePaths []string, packages map[string]*parsedPackage, changed map[string]bool, relevantDirectories map[string]bool) []string {
-	if len(changed) == 0 {
-		return slices.Clone(packagePaths)
-	}
-	selected := map[string]bool{}
-	importers := make(map[string][]string, len(packages))
-	for _, packagePath := range packagePaths {
-		group := packages[packagePath]
-		for index, file := range group.files {
-			if changed[group.paths[index]] || relevantDirectories[filepath.Dir(group.paths[index])] {
-				selected[packagePath] = true
-			}
-			for _, spec := range file.Imports {
-				importPath, err := strconv.Unquote(spec.Path.Value)
-				if err == nil && packages[importPath] != nil {
-					importers[importPath] = append(importers[importPath], packagePath)
-				}
-			}
-		}
-	}
-	expandReverseImporters(selected, importers)
-	result := make([]string, 0, len(selected))
-	for _, packagePath := range packagePaths {
-		if selected[packagePath] {
-			result = append(result, packagePath)
-		}
-	}
-	return result
 }
 
 func fileCallsMethodNamed(file *ast.File, methodNames map[string]bool) bool {
